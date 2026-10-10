@@ -360,12 +360,17 @@ fn acousticSlot(source: u32, field: u32) -> u32 { return ACOUSTIC + ACOUSTIC_STR
 // conserved). Contributions are scattered with fixed-point integer atomics (WGSL has no float
 // atomics) and gathered into ext; the Newton operator sees them as diagonal blocks.
 //
-// Faces are hashed by centroid once per substep at the predicted iterate. Detection keeps each node's
-// K nearest faces within reach and an OGC-style directional bound from the nearest face at the start
-// of the substep: the step may close only a share of the clearance down to a hard core, so no force
-// (a hand pressing a flap down) carries a node through it, while sliding stays free. Faces within two
-// lattice cells of a node are ignored: on a 3.4 mm lattice they cannot meet it short of an impossibly
-// tight fold, and bounding against them would throttle every fast pull of the sheet.
+// Faces are hashed by centroid once per substep at the predicted iterate (and at the start of the
+// substep when that is another cell). Detection keeps each node's K nearest faces within reach and an
+// OGC-style directional bound, relative between node and face: against the first face the node's
+// predicted path crosses, else the nearest face at the start of the substep, the node's step may close
+// only a share of the clearance down to a hard core, and the face's corners may close no more than the
+// same share toward it (resolveBounds). Together they never close the gap, so no force (a hand pulling
+// cloth up through a flap, a flap swinging onto a strand) carries one through the other, while sliding
+// stays free. Faces within two lattice cells of a node, and still linked to it through surviving
+// spans, are ignored: on a 3.4 mm lattice they cannot meet it short of an impossibly tight fold, and
+// bounding against them would throttle every fast pull of the sheet. Across a tear they are another
+// lip or flap and are tested like any other face.
 
 const K: u32 = 4u;
 const NONE: u32 = 0xFFFFFFFFu;
@@ -395,8 +400,13 @@ struct SelfU {
 // per hashed face, 2 vec4: its centroid now and a radius bounding it now and at the start of the
 // substep (w), its centroid at the start of the substep and the face index (w, exact below 2^24)
 @group(0) @binding(7) var<storage, read_write> items: array<vec4<f32>>;
-@group(0) @binding(8) var<storage, read_write> pairs: array<u32>;
-@group(0) @binding(9) var<storage, read_write> cmeta: array<vec4<f32>>; // dx at detection, bound
+// K candidate faces per node, then per node: the reciprocal-bound key (detect, resolveBounds) and the
+// damage mark of its lattice row (damageRow)
+@group(0) @binding(8) var<storage, read_write> pairs: array<atomic<u32>>;
+// 2 per node: the node's own bound (unit normal away from the face, largest approach along it) and the
+// reciprocal bound of a face corner (direction toward the bounded node, largest motion along it);
+// zero normal: unbounded
+@group(0) @binding(9) var<storage, read_write> cmeta: array<vec4<f32>>;
 @group(0) @binding(10) var<storage, read_write> acc: array<atomic<i32>>;
 @group(0) @binding(11) var<storage, read_write> ext: array<vec4<f32>>; // 3 per node
 
@@ -509,11 +519,24 @@ fn faceHitP(p: vec3<f32>, p00: vec3<f32>, p10: vec3<f32>, p01: vec3<f32>, p11: v
 
 // ---------------------------------------------------------------- detection (once per substep)
 
+// A face is hashed by its centroid at the predicted iterate and, when that lies in another cell, also
+// by its centroid at the start of the substep: a node's search near its start position finds the faces
+// that were near it then, however fast they move.
+fn hashFace(f: u32) -> vec2<u32> {
+  let c = corners(f);
+  let h1 = hashCell(cellOf(centroid(c)));
+  let c0 = cellOf(0.25 * (x[c.x].xyz + x[c.y].xyz + x[c.z].xyz + x[c.w].xyz));
+  let h0 = select(hashCell(c0), NONE, all(c0 == cellOf(centroid(c))));
+  return vec2<u32>(h1, h0);
+}
+
 @compute @workgroup_size(128)
 fn faceCount(@builtin(global_invocation_id) gid: vec3<u32>) {
   let f = gid.x;
   if (f >= P.counts.x || !faceValid(f)) { return; }
-  atomicAdd(&cells[hashCell(cellOf(centroid(corners(f))))], 1u);
+  let h = hashFace(f);
+  atomicAdd(&cells[h.x], 1u);
+  if (h.y != NONE) { atomicAdd(&cells[h.y], 1u); }
 }
 
 // After the exclusive scan, cells[0, T) holds start offsets.
@@ -522,8 +545,6 @@ fn faceFill(@builtin(global_invocation_id) gid: vec3<u32>) {
   let f = gid.x;
   if (f >= P.counts.x || !faceValid(f)) { return; }
   let c = corners(f);
-  let h = hashCell(cellOf(centroid(c)));
-  let slot = atomicLoad(&cells[h]) + atomicAdd(&cells[tableMask() + 1u + h], 1u);
   // bounding spheres for the query's rejection test (one radius bounds both)
   let a0 = x[c.x].xyz;
   let b0 = x[c.y].xyz;
@@ -537,23 +558,132 @@ fn faceFill(@builtin(global_invocation_id) gid: vec3<u32>) {
   let m1 = 0.25 * (a1 + b1 + e1 + g1);
   let r0 = max(max(dot(a0 - m0, a0 - m0), dot(b0 - m0, b0 - m0)), max(dot(e0 - m0, e0 - m0), dot(g0 - m0, g0 - m0)));
   let r1 = max(max(dot(a1 - m1, a1 - m1), dot(b1 - m1, b1 - m1)), max(dot(e1 - m1, e1 - m1), dot(g1 - m1, g1 - m1)));
-  items[2u * slot] = vec4<f32>(m1, sqrt(max(r0, r1)));
-  items[2u * slot + 1u] = vec4<f32>(m0, f32(f));
+  let i1 = vec4<f32>(m1, sqrt(max(r0, r1)));
+  let i0 = vec4<f32>(m0, f32(f));
+  let h = hashFace(f);
+  let slot = atomicLoad(&cells[h.x]) + atomicAdd(&cells[tableMask() + 1u + h.x], 1u);
+  items[2u * slot] = i1;
+  items[2u * slot + 1u] = i0;
+  if (h.y != NONE) {
+    let s0 = atomicLoad(&cells[h.y]) + atomicAdd(&cells[tableMask() + 1u + h.y], 1u);
+    items[2u * s0] = i1;
+    items[2u * s0 + 1u] = i0;
+  }
 }
+
+// Distance from point q to segment (a, b).
+fn segDist(q: vec3<f32>, a: vec3<f32>, b: vec3<f32>) -> f32 {
+  let e = b - a;
+  let s = clamp(dot(q - a, e) / max(dot(e, e), 1e-20), 0.0, 1.0);
+  return length(q - a - s * e);
+}
+
+// Segment (o, o + d) against triangle (a, b, c): the segment parameter of the crossing, or 2 if none.
+fn segTri(o: vec3<f32>, d: vec3<f32>, a: vec3<f32>, b: vec3<f32>, c: vec3<f32>) -> f32 {
+  let e1 = b - a;
+  let e2 = c - a;
+  let p = cross(d, e2);
+  let det = dot(e1, p);
+  if (abs(det) < 1e-18) { return 2.0; }
+  let inv = 1.0 / det;
+  let s = o - a;
+  let u = dot(s, p) * inv;
+  if (u < 0.0 || u > 1.0) { return 2.0; }
+  let q = cross(s, e1);
+  let v = dot(d, q) * inv;
+  if (v < 0.0 || u + v > 1.0) { return 2.0; }
+  let t = dot(e2, q) * inv;
+  return select(2.0, t, t >= 0.0 && t <= 1.0);
+}
+
+// Where the node's predicted path (o, o + d) first crosses the face with corners c, at its start
+// positions or at its predicted ones (2 if it does not).
+fn pathCrossing(o: vec3<f32>, d: vec3<f32>, c: vec4<u32>) -> f32 {
+  let a0 = x[c.x].xyz;
+  let b0 = x[c.y].xyz;
+  let e0 = x[c.z].xyz;
+  let g0 = x[c.w].xyz;
+  var t = min(segTri(o, d, a0, b0, g0), segTri(o, d, a0, g0, e0));
+  t = min(t, min(segTri(o, d, cur(c.x), cur(c.y), cur(c.w)), segTri(o, d, cur(c.x), cur(c.w), cur(c.z))));
+  return t;
+}
+
+// Lattice node (i, j) of layer offset/stride L.
+fn latticeNode(L: vec4<u32>, i: i32, j: i32) -> u32 { return L.x + u32(j) * L.y + u32(i); }
+
+// Surviving material along a lattice row (fixed j) from i0 to i1, or a column (fixed i) from j0 to j1.
+fn rowHolds(L: vec4<u32>, j: i32, i0: i32, i1: i32) -> bool {
+  for (var i = min(i0, i1); i < max(i0, i1); i++) {
+    let a = latticeNode(L, i, j);
+    if (!segActive(segs[2u * a]) || !cloth(a) || !cloth(a + 1u)) { return false; }
+  }
+  return true;
+}
+fn columnHolds(L: vec4<u32>, i: i32, j0: i32, j1: i32) -> bool {
+  for (var j = min(j0, j1); j < max(j0, j1); j++) {
+    let a = latticeNode(L, i, j);
+    if (!segActive(segs[2u * a + 1u]) || !cloth(a) || !cloth(a + L.y)) { return false; }
+  }
+  return true;
+}
+
+// Whether node (ni, nj) still reaches face (fi, fj) through surviving spans along either L-shaped
+// lattice path to the face's nearest corner. Such a face (within the exclusion window) is the node's own
+// cloth and cannot meet it short of an impossibly tight fold; across a tear it is another lip or flap,
+// and a contact face like any other.
+fn latticeLinked(L: vec4<u32>, ni: i32, nj: i32, fi: i32, fj: i32) -> bool {
+  let ci = clamp(ni, fi, fi + 1);
+  let cj = clamp(nj, fj, fj + 1);
+  if (rowHolds(L, nj, ni, ci) && columnHolds(L, ci, nj, cj)) { return true; }
+  return columnHolds(L, ni, nj, cj) && rowHolds(L, cj, ni, ci);
+}
+
+// Exclusion window reach in lattice cells (detect skips linked faces with di, dj in [-3, 2]; their
+// linking paths run through nodes within 3 cells).
+const WINDOW: i32 = 3;
+
+// Per node: whether any crossing within WINDOW along its lattice row has a broken span or left the
+// cloth. detect reads the marks of the 2 WINDOW + 1 rows around a node: without damage there, every
+// face in its exclusion window is its own intact cloth and needs no linking test.
+@compute @workgroup_size(128)
+fn damageRow(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let n = gid.x;
+  if (n >= P.counts.x) { return; }
+  let ijl = nodes[n].ijl;
+  let L = P.layers[ijl >> 24u].lattice;
+  let i = i32(ijl & 0xFFFu);
+  let j = i32((ijl >> 12u) & 0xFFFu);
+  var mark = 0u;
+  for (var a = max(i - WINDOW, 0); a <= min(i + WINDOW, i32(L.y) - 1); a++) {
+    let m = latticeNode(L, a, j);
+    let fu = segs[2u * m].flags;
+    let fv = segs[2u * m + 1u].flags;
+    if (!cloth(m) || (fu & SEG_BROKEN) != 0u || (fv & SEG_BROKEN) != 0u) { mark = 1u; }
+  }
+  atomicStore(&pairs[(K + 1u) * P.counts.x + n], mark);
+}
+
+// Bound of the reciprocal pass: (4095 - share in 10 um) << 20 | (node + 1); the largest key is the
+// tightest share (ties: any node), zero means none.
+const RECIP_UNIT: f32 = 1e-5;
 
 @compute @workgroup_size(128)
 fn detect(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = gid.x;
   if (n >= P.counts.x) { return; }
-  for (var k = 0u; k < K; k++) { pairs[K * n + k] = NONE; }
+  for (var k = 0u; k < K; k++) { atomicStore(&pairs[K * n + k], NONE); }
   // ballistic debris is bounded against the cloth too (it lands on it instead of falling through), but
   // takes no penalty terms (step.wgsl commit clips its fall); retired nodes are out of the scene
   if ((nodes[n].flags & NODE_PINNED) != 0u || x[n].w > 1.5) {
-    cmeta[n] = vec4<f32>(0.0, 0.0, 0.0, 1e9);
+    cmeta[2u * n] = vec4<f32>(0.0, 0.0, 0.0, 1e9);
     return;
   }
   let p = cur(n);
+  let p0 = x[n].xyz;
+  let path = p - p0;
+  let moving = dot(path, path) > HARD_CORE * HARD_CORE;
   let reach = SU.grid.z;
+  let cell = SU.grid.x;
   let T = tableMask() + 1u;
   var best: array<u32, 4>;
   var bestD: array<f32, 4>;
@@ -562,44 +692,65 @@ fn detect(@builtin(global_invocation_id) gid: vec3<u32>) {
     bestD[k] = 1e9;
   }
   // nearest face at the start of the substep (positions x): the bound's normal and clearance
-  let p0 = x[n].xyz;
   var d0min = 1e9;
   var n0 = vec3<f32>(0.0);
-  // the 2 x 2 x 2 hash cells nearest to the node: every face centroid within half a cell of it
-  let g = p / SU.grid.x;
-  let c0 = vec3<i32>(floor(g));
-  let side = select(vec3<i32>(-1), vec3<i32>(1), fract(g) >= vec3<f32>(0.5));
-  // faces near the node in the lattice (their nearest corner within two cells): skipped
+  var f0 = NONE;
+  // the first face the predicted path crosses: its plane bounds the step instead
+  var tc = 2.0;
+  var fc = NONE;
+  // every hash cell within half a cell of the predicted path: each face centroid within half a cell of
+  // its start or end (a slow node scans the 2 x 2 x 2 cells nearest to it; a path over 2.5 cells is
+  // covered from its start)
+  let lo = vec3<i32>(floor(min(p, p0) / cell - 0.5));
+  let hi = min(vec3<i32>(floor(max(p, p0) / cell + 0.5)), lo + vec3<i32>(3));
+  // faces near the node in the lattice (their nearest corner within two cells) and still linked to it
+  // through surviving spans: skipped
   let ijl = nodes[n].ijl;
   let ni = i32(ijl & 0xFFFu);
   let nj = i32((ijl >> 12u) & 0xFFFu);
   let nl = ijl >> 24u;
-  for (var oz = 0; oz <= 1; oz++) {
-    for (var oy = 0; oy <= 1; oy++) {
-      for (var ox = 0; ox <= 1; ox++) {
-        let h = hashCell(c0 + vec3<i32>(ox, oy, oz) * side);
+  let NL = P.layers[nl].lattice;
+  var damaged = false;
+  for (var b = max(nj - WINDOW, 0); b <= min(nj + WINDOW, i32(NL.z) - 1); b++) {
+    if (atomicLoad(&pairs[(K + 1u) * P.counts.x + latticeNode(NL, ni, b)]) != 0u) { damaged = true; }
+  }
+  for (var cz = lo.z; cz <= hi.z; cz++) {
+    for (var cy = lo.y; cy <= hi.y; cy++) {
+      for (var cx = lo.x; cx <= hi.x; cx++) {
+        let h = hashCell(vec3<i32>(cx, cy, cz));
         let start = atomicLoad(&cells[h]);
         let count = atomicLoad(&cells[T + h]);
         for (var q = 0u; q < count; q++) {
           // the closest-point distance is never below |p - centroid| - radius: faces that cannot
-          // matter (beyond the reach now, and no nearer than the bound's best at the start) are
-          // rejected from their compact record without touching their corners; the result is unchanged
+          // matter (beyond the reach now, no nearer than the bound's best at the start, off the path)
+          // are rejected from their compact record without touching their corners
           let i1 = items[2u * (start + q)];
           let i0 = items[2u * (start + q) + 1u];
           let nearNow = length(p - i1.xyz) - i1.w < reach;
-          let nearStart = length(p0 - i0.xyz) - i1.w < min(d0min, 0.5 * SU.grid.x);
-          if (!nearNow && !nearStart) { continue; }
+          let nearStart = length(p0 - i0.xyz) - i1.w < min(d0min, 0.5 * cell);
+          let onPath = moving && min(segDist(i0.xyz, p0, p), segDist(i1.xyz, p0, p)) < i1.w;
+          if (!nearNow && !nearStart && !onPath) { continue; }
           let f = u32(i0.w);
           let fijl = nodes[f].ijl;
           let di = i32(fijl & 0xFFFu) - ni;
           let dj = i32((fijl >> 12u) & 0xFFFu) - nj;
-          if ((fijl >> 24u) == nl && di >= -3 && di <= 2 && dj >= -3 && dj <= 2) { continue; }
+          if ((fijl >> 24u) == nl && di >= -3 && di <= 2 && dj >= -3 && dj <= 2 && (!damaged || latticeLinked(NL, ni, nj, ni + di, nj + dj))) { continue; }
           let cf = corners(f);
+          // ties (a closest point on an edge two faces share) go to the lower face index: the result
+          // must not depend on the order the hash was filled in
           if (nearStart) {
             let s0 = faceHitAt(p0, cf);
-            if (s0.d < d0min && s0.d > 1e-9) {
+            if ((s0.d < d0min || (s0.d == d0min && f < f0)) && s0.d > 1e-9) {
               d0min = s0.d;
               n0 = (p0 - s0.q) / s0.d;
+              f0 = f;
+            }
+          }
+          if (onPath) {
+            let t = pathCrossing(p0, path, cf);
+            if (t < tc || (t == tc && t <= 1.0 && f < fc)) {
+              tc = t;
+              fc = f;
             }
           }
           if (!nearNow) { continue; }
@@ -609,7 +760,7 @@ fn detect(@builtin(global_invocation_id) gid: vec3<u32>) {
           var cd = hit.d;
           for (var k = 0u; k < K; k++) {
             if (cand == best[k]) { break; }
-            if (cd < bestD[k]) {
+            if (cd < bestD[k] || (cd == bestD[k] && cand < best[k])) {
               let ts = best[k];
               let td = bestD[k];
               best[k] = cand;
@@ -623,14 +774,60 @@ fn detect(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
   if (cloth(n)) {
-    for (var k = 0u; k < K; k++) { pairs[K * n + k] = best[k]; }
+    for (var k = 0u; k < K; k++) { atomicStore(&pairs[K * n + k], best[k]); }
   }
-  // approach toward the nearest face limited to a share of the clearance above the hard core
-  if (d0min < 0.5 * SU.grid.x) {
-    cmeta[n] = vec4<f32>(n0, SU.law.w * max(d0min - HARD_CORE, 0.0));
-  } else {
-    cmeta[n] = vec4<f32>(0.0, 0.0, 0.0, 1e9);
+  // the bound: against the first face the predicted path crosses (its plane, on the side the node
+  // starts on), else against the nearest face at the start
+  var nb = n0;
+  var db = d0min;
+  var fb = f0;
+  if (fc != NONE && fc != f0) {
+    let c = corners(fc);
+    let a = x[c.x].xyz;
+    var nrm = cross(x[c.y].xyz - a, x[c.z].xyz - a);
+    let ln = length(nrm);
+    if (ln > 1e-12) {
+      nrm /= ln;
+      let side = dot(p0 - a, nrm);
+      nb = select(-nrm, nrm, side >= 0.0);
+      db = abs(side);
+      fb = fc;
+    }
   }
+  if (fb == NONE || (fb == f0 && db >= 0.5 * cell)) {
+    cmeta[2u * n] = vec4<f32>(0.0, 0.0, 0.0, 1e9);
+    return;
+  }
+  // approach toward the face limited to a share of the clearance above the hard core; the face's
+  // corners may close no more than the same share toward the node (resolveBounds), so together they
+  // never close the clearance
+  let share = SU.law.w * max(db - HARD_CORE, 0.0);
+  cmeta[2u * n] = vec4<f32>(nb, share);
+  if (!cloth(n)) { return; }
+  let key = ((4095u - min(4095u, u32(share / RECIP_UNIT))) << 20u) | (n + 1u);
+  let c = corners(fb);
+  let base = K * P.counts.x;
+  atomicMax(&pairs[base + c.x], key);
+  atomicMax(&pairs[base + c.y], key);
+  atomicMax(&pairs[base + c.z], key);
+  atomicMax(&pairs[base + c.w], key);
+}
+
+// Reciprocal bounds: a node that is the corner of a face some node bounds itself against may not move
+// toward that node by more than the same share (the tightest such node; its normal from its own bound).
+// Clears the reciprocal keys for the next substep.
+@compute @workgroup_size(128)
+fn resolveBounds(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let n = gid.x;
+  if (n >= P.counts.x) { return; }
+  let key = atomicExchange(&pairs[K * P.counts.x + n], 0u);
+  if (key == 0u) {
+    cmeta[2u * n + 1u] = vec4<f32>(0.0, 0.0, 0.0, 1e9);
+    return;
+  }
+  let j = (key & 0xFFFFFu) - 1u;
+  let share = f32(4095u - (key >> 20u)) * RECIP_UNIT;
+  cmeta[2u * n + 1u] = vec4<f32>(-cmeta[2u * j].xyz, share);
 }
 
 // ---------------------------------------------------------------- terms (every Newton iteration)
@@ -656,7 +853,7 @@ fn terms(@builtin(global_invocation_id) gid: vec3<u32>) {
   let epsU = SU.law.z * P.hg.x;
   let I3 = mat3x3<f32>(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, 1.0));
   for (var k = 0u; k < K; k++) {
-    let f = pairs[K * n + k];
+    let f = atomicLoad(&pairs[K * n + k]);
     if (f == NONE) { continue; }
     let c = corners(f);
     let hit = faceHit(p, c);
@@ -762,7 +959,7 @@ fn addBlockSums(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_
   if (a < n) { data[a] += add; }
   if (a + 1u < n) { data[a + 1u] += add; }
 }
-`;const b={cell:.012,tableBits:17,reach:.003,distance:.001,stiffness:500,friction:.45,frictionSpeed:.002,boundFraction:.45};var x=class{meta;s;mod;scan;pipes={};group;scanGroups=[];cells;items;constructor(e){this.s=e;let t=e.device,n=1<<b.tableBits,r=/* @__PURE__ */ new Float32Array(8);r.set([b.cell,0,b.reach,b.distance],0),new Uint32Array(r.buffer)[1]=n-1,r.set([b.stiffness,b.friction,b.frictionSpeed,b.boundFraction],4);let s=o(t,`selfContactU`,r,i);this.cells=a(t,`selfContact.cells`,8*n);let c=a(t,`selfContact.items`,32*e.N);this.items=c;let l=a(t,`selfContact.pairs`,16*e.N),u=a(t,`selfContact.acc`,36*e.N);this.meta=a(t,`selfContact.meta`,16*e.N),this.mod=new f(t,`selfContact`,_+v);for(let e of[`faceCount`,`faceFill`,`detect`,`terms`,`gather`])this.pipes[e]=this.mod.pipeline(e);this.group=this.mod.bindGroup(`selfContact`,{0:e.simParams,1:s,2:e.nodes,3:e.x,4:e.dx,5:e.segs,6:this.cells,7:c,8:l,9:this.meta,10:u,11:e.ext}),this.scan=new f(t,`scan`,y),this.pipes.scanBlocks=this.scan.pipeline(`scanBlocks`),this.pipes.addBlockSums=this.scan.pipeline(`addBlockSums`);let d=n,p={buffer:this.cells,offset:0,size:4*n};for(;;){let e=Math.ceil(d/512),n=a(t,`selfContact.scan${this.scanGroups.length}`,4*Math.max(e,4)),r=o(t,`selfContact.scanU`,new Uint32Array([d,0,0,0]),i);if(this.scanGroups.push({scan:this.scan.bindGroup(`scan`,{0:r,1:p,2:n}),add:this.scan.bindGroup(`scanAdd`,{0:r,1:p,2:n}),blocks:e}),e===1)break;p={buffer:n},d=e}}run(e,t,n,r=this.group){e.setPipeline(this.pipes[t]),e.setBindGroup(0,r),e.dispatchWorkgroups(n)}encodeClear(e){e.clearBuffer(this.cells)}encodeDetect(e,t=15){let n=Math.ceil(this.s.N/128);if(t&1&&this.run(e,`faceCount`,n),t&2){for(let t of this.scanGroups)this.run(e,`scanBlocks`,t.blocks,t.scan);for(let t=this.scanGroups.length-2;t>=0;t--)this.run(e,`addBlockSums`,this.scanGroups[t].blocks,this.scanGroups[t].add)}t&4&&this.run(e,`faceFill`,n),t&8&&this.run(e,`detect`,n)}encodeTerms(e){let t=Math.ceil(this.s.N/128);this.run(e,`terms`,t),this.run(e,`gather`,t)}};function S(){let e=/* @__PURE__ */ new Float32Array(16);return e[0]=e[5]=e[10]=e[15]=1,e}function C(e,t,n=/* @__PURE__ */ new Float32Array(16)){for(let r=0;r<4;r++)for(let i=0;i<4;i++){let a=0;for(let n=0;n<4;n++)a+=e[n*4+i]*t[r*4+n];n[r*4+i]=a}return n}function w(e,t){return[e[0]-t[0],e[1]-t[1],e[2]-t[2]]}function T(e,t){return e[0]*t[0]+e[1]*t[1]+e[2]*t[2]}function E(e,t){return[e[1]*t[2]-e[2]*t[1],e[2]*t[0]-e[0]*t[2],e[0]*t[1]-e[1]*t[0]]}function D(e){let t=Math.hypot(e[0],e[1],e[2])||1;return[e[0]/t,e[1]/t,e[2]/t]}function O(e,t){return[e[0]*t,e[1]*t,e[2]*t]}function k(e,t){return[e[0]+t[0],e[1]+t[1],e[2]+t[2]]}function A(e,t,n){let r=D(w(t,e)),i=D(E(r,n)),a=E(i,r),o=S();return o[0]=i[0],o[4]=i[1],o[8]=i[2],o[1]=a[0],o[5]=a[1],o[9]=a[2],o[2]=-r[0],o[6]=-r[1],o[10]=-r[2],o[12]=-T(i,e),o[13]=-T(a,e),o[14]=T(r,e),o}function ee(e,t,n,r){let i=1/Math.tan(e/2),a=/* @__PURE__ */ new Float32Array(16);return a[0]=i/t,a[5]=i,a[10]=r/(n-r),a[11]=-1,a[14]=n*r/(n-r),a}function te(e,t,n,r,i,a){let o=S();return o[0]=2/(t-e),o[5]=2/(r-n),o[10]=1/(i-a),o[12]=-(t+e)/(t-e),o[13]=-(r+n)/(r-n),o[14]=i/(i-a),o}function ne(e){let t=/* @__PURE__ */ new Float32Array(16),n=e;t[0]=n[5]*n[10]*n[15]-n[5]*n[11]*n[14]-n[9]*n[6]*n[15]+n[9]*n[7]*n[14]+n[13]*n[6]*n[11]-n[13]*n[7]*n[10],t[4]=-n[4]*n[10]*n[15]+n[4]*n[11]*n[14]+n[8]*n[6]*n[15]-n[8]*n[7]*n[14]-n[12]*n[6]*n[11]+n[12]*n[7]*n[10],t[8]=n[4]*n[9]*n[15]-n[4]*n[11]*n[13]-n[8]*n[5]*n[15]+n[8]*n[7]*n[13]+n[12]*n[5]*n[11]-n[12]*n[7]*n[9],t[12]=-n[4]*n[9]*n[14]+n[4]*n[10]*n[13]+n[8]*n[5]*n[14]-n[8]*n[6]*n[13]-n[12]*n[5]*n[10]+n[12]*n[6]*n[9],t[1]=-n[1]*n[10]*n[15]+n[1]*n[11]*n[14]+n[9]*n[2]*n[15]-n[9]*n[3]*n[14]-n[13]*n[2]*n[11]+n[13]*n[3]*n[10],t[5]=n[0]*n[10]*n[15]-n[0]*n[11]*n[14]-n[8]*n[2]*n[15]+n[8]*n[3]*n[14]+n[12]*n[2]*n[11]-n[12]*n[3]*n[10],t[9]=-n[0]*n[9]*n[15]+n[0]*n[11]*n[13]+n[8]*n[1]*n[15]-n[8]*n[3]*n[13]-n[12]*n[1]*n[11]+n[12]*n[3]*n[9],t[13]=n[0]*n[9]*n[14]-n[0]*n[10]*n[13]-n[8]*n[1]*n[14]+n[8]*n[2]*n[13]+n[12]*n[1]*n[10]-n[12]*n[2]*n[9],t[2]=n[1]*n[6]*n[15]-n[1]*n[7]*n[14]-n[5]*n[2]*n[15]+n[5]*n[3]*n[14]+n[13]*n[2]*n[7]-n[13]*n[3]*n[6],t[6]=-n[0]*n[6]*n[15]+n[0]*n[7]*n[14]+n[4]*n[2]*n[15]-n[4]*n[3]*n[14]-n[12]*n[2]*n[7]+n[12]*n[3]*n[6],t[10]=n[0]*n[5]*n[15]-n[0]*n[7]*n[13]-n[4]*n[1]*n[15]+n[4]*n[3]*n[13]+n[12]*n[1]*n[7]-n[12]*n[3]*n[5],t[14]=-n[0]*n[5]*n[14]+n[0]*n[6]*n[13]+n[4]*n[1]*n[14]-n[4]*n[2]*n[13]-n[12]*n[1]*n[6]+n[12]*n[2]*n[5],t[3]=-n[1]*n[6]*n[11]+n[1]*n[7]*n[10]+n[5]*n[2]*n[11]-n[5]*n[3]*n[10]-n[9]*n[2]*n[7]+n[9]*n[3]*n[6],t[7]=n[0]*n[6]*n[11]-n[0]*n[7]*n[10]-n[4]*n[2]*n[11]+n[4]*n[3]*n[10]+n[8]*n[2]*n[7]-n[8]*n[3]*n[6],t[11]=-n[0]*n[5]*n[11]+n[0]*n[7]*n[9]+n[4]*n[1]*n[11]-n[4]*n[3]*n[9]-n[8]*n[1]*n[7]+n[8]*n[3]*n[5],t[15]=n[0]*n[5]*n[10]-n[0]*n[6]*n[9]-n[4]*n[1]*n[10]+n[4]*n[2]*n[9]+n[8]*n[1]*n[6]-n[8]*n[2]*n[5];let r=n[0]*t[0]+n[1]*t[4]+n[2]*t[8]+n[3]*t[12];r=1/r;for(let e=0;e<16;e++)t[e]*=r;return t}function re(e,t){return[e[0]*t[0]+e[4]*t[1]+e[8]*t[2]+e[12],e[1]*t[0]+e[5]*t[1]+e[9]*t[2]+e[13],e[2]*t[0]+e[6]*t[1]+e[10]*t[2]+e[14],e[3]*t[0]+e[7]*t[1]+e[11]*t[2]+e[15]]}var ie=`// Shared render definitions: frame/layer uniforms, hashing and noise, the woven yarn height model,
+`;const b={cell:.012,tableBits:17,reach:.003,distance:.001,stiffness:500,friction:.45,frictionSpeed:.002,boundFraction:.45};var x=class{meta;s;mod;scan;pipes={};group;scanGroups=[];cells;items;constructor(e){this.s=e;let t=e.device,n=1<<b.tableBits,r=/* @__PURE__ */ new Float32Array(8);r.set([b.cell,0,b.reach,b.distance],0),new Uint32Array(r.buffer)[1]=n-1,r.set([b.stiffness,b.friction,b.frictionSpeed,b.boundFraction],4);let s=o(t,`selfContactU`,r,i);this.cells=a(t,`selfContact.cells`,8*n);let c=a(t,`selfContact.items`,64*e.N);if(this.items=c,e.N>=1<<20)throw Error(`self-contact bound keys hold at most 2^20 - 1 nodes`);let l=a(t,`selfContact.pairs`,24*e.N),u=a(t,`selfContact.acc`,36*e.N);this.meta=a(t,`selfContact.meta`,32*e.N),this.mod=new f(t,`selfContact`,_+v);for(let e of[`faceCount`,`faceFill`,`damageRow`,`detect`,`resolveBounds`,`terms`,`gather`])this.pipes[e]=this.mod.pipeline(e);this.group=this.mod.bindGroup(`selfContact`,{0:e.simParams,1:s,2:e.nodes,3:e.x,4:e.dx,5:e.segs,6:this.cells,7:c,8:l,9:this.meta,10:u,11:e.ext}),this.scan=new f(t,`scan`,y),this.pipes.scanBlocks=this.scan.pipeline(`scanBlocks`),this.pipes.addBlockSums=this.scan.pipeline(`addBlockSums`);let d=n,p={buffer:this.cells,offset:0,size:4*n};for(;;){let e=Math.ceil(d/512),n=a(t,`selfContact.scan${this.scanGroups.length}`,4*Math.max(e,4)),r=o(t,`selfContact.scanU`,new Uint32Array([d,0,0,0]),i);if(this.scanGroups.push({scan:this.scan.bindGroup(`scan`,{0:r,1:p,2:n}),add:this.scan.bindGroup(`scanAdd`,{0:r,1:p,2:n}),blocks:e}),e===1)break;p={buffer:n},d=e}}run(e,t,n,r=this.group){e.setPipeline(this.pipes[t]),e.setBindGroup(0,r),e.dispatchWorkgroups(n)}encodeClear(e){e.clearBuffer(this.cells)}encodeDetect(e,t=15){let n=Math.ceil(this.s.N/128);if(t&1&&this.run(e,`faceCount`,n),t&2){for(let t of this.scanGroups)this.run(e,`scanBlocks`,t.blocks,t.scan);for(let t=this.scanGroups.length-2;t>=0;t--)this.run(e,`addBlockSums`,this.scanGroups[t].blocks,this.scanGroups[t].add)}t&4&&this.run(e,`faceFill`,n),t&8&&(this.run(e,`damageRow`,n),this.run(e,`detect`,n),this.run(e,`resolveBounds`,n))}encodeTerms(e){let t=Math.ceil(this.s.N/128);this.run(e,`terms`,t),this.run(e,`gather`,t)}};function S(){let e=/* @__PURE__ */ new Float32Array(16);return e[0]=e[5]=e[10]=e[15]=1,e}function C(e,t,n=/* @__PURE__ */ new Float32Array(16)){for(let r=0;r<4;r++)for(let i=0;i<4;i++){let a=0;for(let n=0;n<4;n++)a+=e[n*4+i]*t[r*4+n];n[r*4+i]=a}return n}function w(e,t){return[e[0]-t[0],e[1]-t[1],e[2]-t[2]]}function T(e,t){return e[0]*t[0]+e[1]*t[1]+e[2]*t[2]}function E(e,t){return[e[1]*t[2]-e[2]*t[1],e[2]*t[0]-e[0]*t[2],e[0]*t[1]-e[1]*t[0]]}function D(e){let t=Math.hypot(e[0],e[1],e[2])||1;return[e[0]/t,e[1]/t,e[2]/t]}function O(e,t){return[e[0]*t,e[1]*t,e[2]*t]}function k(e,t){return[e[0]+t[0],e[1]+t[1],e[2]+t[2]]}function A(e,t,n){let r=D(w(t,e)),i=D(E(r,n)),a=E(i,r),o=S();return o[0]=i[0],o[4]=i[1],o[8]=i[2],o[1]=a[0],o[5]=a[1],o[9]=a[2],o[2]=-r[0],o[6]=-r[1],o[10]=-r[2],o[12]=-T(i,e),o[13]=-T(a,e),o[14]=T(r,e),o}function ee(e,t,n,r){let i=1/Math.tan(e/2),a=/* @__PURE__ */ new Float32Array(16);return a[0]=i/t,a[5]=i,a[10]=r/(n-r),a[11]=-1,a[14]=n*r/(n-r),a}function te(e,t,n,r,i,a){let o=S();return o[0]=2/(t-e),o[5]=2/(r-n),o[10]=1/(i-a),o[12]=-(t+e)/(t-e),o[13]=-(r+n)/(r-n),o[14]=i/(i-a),o}function ne(e){let t=/* @__PURE__ */ new Float32Array(16),n=e;t[0]=n[5]*n[10]*n[15]-n[5]*n[11]*n[14]-n[9]*n[6]*n[15]+n[9]*n[7]*n[14]+n[13]*n[6]*n[11]-n[13]*n[7]*n[10],t[4]=-n[4]*n[10]*n[15]+n[4]*n[11]*n[14]+n[8]*n[6]*n[15]-n[8]*n[7]*n[14]-n[12]*n[6]*n[11]+n[12]*n[7]*n[10],t[8]=n[4]*n[9]*n[15]-n[4]*n[11]*n[13]-n[8]*n[5]*n[15]+n[8]*n[7]*n[13]+n[12]*n[5]*n[11]-n[12]*n[7]*n[9],t[12]=-n[4]*n[9]*n[14]+n[4]*n[10]*n[13]+n[8]*n[5]*n[14]-n[8]*n[6]*n[13]-n[12]*n[5]*n[10]+n[12]*n[6]*n[9],t[1]=-n[1]*n[10]*n[15]+n[1]*n[11]*n[14]+n[9]*n[2]*n[15]-n[9]*n[3]*n[14]-n[13]*n[2]*n[11]+n[13]*n[3]*n[10],t[5]=n[0]*n[10]*n[15]-n[0]*n[11]*n[14]-n[8]*n[2]*n[15]+n[8]*n[3]*n[14]+n[12]*n[2]*n[11]-n[12]*n[3]*n[10],t[9]=-n[0]*n[9]*n[15]+n[0]*n[11]*n[13]+n[8]*n[1]*n[15]-n[8]*n[3]*n[13]-n[12]*n[1]*n[11]+n[12]*n[3]*n[9],t[13]=n[0]*n[9]*n[14]-n[0]*n[10]*n[13]-n[8]*n[1]*n[14]+n[8]*n[2]*n[13]+n[12]*n[1]*n[10]-n[12]*n[2]*n[9],t[2]=n[1]*n[6]*n[15]-n[1]*n[7]*n[14]-n[5]*n[2]*n[15]+n[5]*n[3]*n[14]+n[13]*n[2]*n[7]-n[13]*n[3]*n[6],t[6]=-n[0]*n[6]*n[15]+n[0]*n[7]*n[14]+n[4]*n[2]*n[15]-n[4]*n[3]*n[14]-n[12]*n[2]*n[7]+n[12]*n[3]*n[6],t[10]=n[0]*n[5]*n[15]-n[0]*n[7]*n[13]-n[4]*n[1]*n[15]+n[4]*n[3]*n[13]+n[12]*n[1]*n[7]-n[12]*n[3]*n[5],t[14]=-n[0]*n[5]*n[14]+n[0]*n[6]*n[13]+n[4]*n[1]*n[14]-n[4]*n[2]*n[13]-n[12]*n[1]*n[6]+n[12]*n[2]*n[5],t[3]=-n[1]*n[6]*n[11]+n[1]*n[7]*n[10]+n[5]*n[2]*n[11]-n[5]*n[3]*n[10]-n[9]*n[2]*n[7]+n[9]*n[3]*n[6],t[7]=n[0]*n[6]*n[11]-n[0]*n[7]*n[10]-n[4]*n[2]*n[11]+n[4]*n[3]*n[10]+n[8]*n[2]*n[7]-n[8]*n[3]*n[6],t[11]=-n[0]*n[5]*n[11]+n[0]*n[7]*n[9]+n[4]*n[1]*n[11]-n[4]*n[3]*n[9]-n[8]*n[1]*n[7]+n[8]*n[3]*n[5],t[15]=n[0]*n[5]*n[10]-n[0]*n[6]*n[9]-n[4]*n[1]*n[10]+n[4]*n[2]*n[9]+n[8]*n[1]*n[6]-n[8]*n[2]*n[5];let r=n[0]*t[0]+n[1]*t[4]+n[2]*t[8]+n[3]*t[12];r=1/r;for(let e=0;e<16;e++)t[e]*=r;return t}function j(e,t){return[e[0]*t[0]+e[4]*t[1]+e[8]*t[2]+e[12],e[1]*t[0]+e[5]*t[1]+e[9]*t[2]+e[13],e[2]*t[0]+e[6]*t[1]+e[10]*t[2]+e[14],e[3]*t[0]+e[7]*t[1]+e[11]*t[2]+e[15]]}var re=`// Shared render definitions: frame/layer uniforms, hashing and noise, the woven yarn height model,
 // yarn appearance and the fiber BRDF. Used by the surface, explicit-yarn, fuzz and shadow passes so
 // intact cloth and freed yarns are the same material.
 
@@ -1214,7 +1411,7 @@ fn yarnLook(L: LayerR, layerIdx: u32, fam: u32, yarn: i32, float_: i32, along: f
   return o;
 }
 
-`,ae=`// Lighting shared by the shaded passes (requires a module-scope \`F: FrameU\` uniform and the shadow
+`,ie=`// Lighting shared by the shaded passes (requires a module-scope \`F: FrameU\` uniform and the shadow
 // maps shadowMap (key), overMap (overhead light) with shadowSampler).
 
 // ---------------------------------------------------------------- lighting
@@ -1316,7 +1513,7 @@ fn shadowOver(world: vec3<f32>, nrmW: vec3<f32>) -> f32 {
 fn overShade(N: vec3<f32>, T: vec3<f32>, V: vec3<f32>, albedo: vec3<f32>, fuzz: f32, world: vec3<f32>, nrmW: vec3<f32>) -> vec3<f32> {
   return fiberShade(N, T, V, F.overDir.xyz, albedo, fuzz) * F.overColor.rgb * shadowOver(world, nrmW);
 }
-`,oe=`// Per-frame geometry preparation from the accepted mechanical state:
+`,ae=`// Per-frame geometry preparation from the accepted mechanical state:
 //  - nodeFrame: per-node unit normal and +u / +v tangents from connected yarn neighbours (holes never
 //    bridge; a missing direction completes the frame and an isolated node keeps its last frame),
 //  - classify: per-cell flags and the compact list of fine cells (drawn per crossing, surface.wgsl),
@@ -1563,7 +1760,7 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
   rsurf[3u * r + 1u] = vec4<f32>(dPs, 0.0);
   rsurf[3u * r + 2u] = vec4<f32>(dPt, 0.0);
 }
-`,se=`// Woven cloth surface. Intact cells: one instance per lattice cell, S x S sub-quads of the refined
+`,oe=`// Woven cloth surface. Intact cells: one instance per lattice cell, S x S sub-quads of the refined
 // bicubic surface. Cells near damage (pieces.wgsl gives a node of theirs a connection field, or a span
 // of theirs has separated) are drawn per crossing instead (vsFine): one quad per crossing that has
 // surface material, each placed from the cell's corners it is connected to (material_map.wgsl), so
@@ -2105,7 +2302,7 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
   o.mask = mask;
   return o;
 }
-`,ce=`// Where a material point of the cloth is (pieces.wgsl): the refined lattice surface of its cell,
+`,se=`// Where a material point of the cloth is (pieces.wgsl): the refined lattice surface of its cell,
 // corrected toward the nodes it is still connected to. Requires module-scope R (RenderU), rsurf
 // (refine.wgsl samples), x (positions), tframe (node tangent frames) and kappaM (pieces.wgsl).
 //
@@ -2247,7 +2444,7 @@ fn crossingPoint(l: u32, k: i32, m: i32) -> MatPoint {
   let kap = vec4<f32>(kappaAt(l, n00, k, m), kappaAt(l, n00 + 1u, k, m), kappaAt(l, n00 + L.y, k, m), kappaAt(l, n00 + L.y + 1u, k, m));
   return matPoint(l, ci, cj, cc.z, cc.w, kap);
 }
-`,le=`// Material connectivity of the cloth around each lattice node (rebuilt with the loose threads, when
+`,ce=`// Material connectivity of the cloth around each lattice node (rebuilt with the loose threads, when
 // the yarn field changed).
 //
 // The mechanical lattice carries forces at bundle resolution; where the cloth is torn, which material
@@ -2574,7 +2771,7 @@ fn kappaSolve(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_in
     atomicStore(&kappa[slotHash(slot)], h | select(0u, 0x80000000u, unclean == 0u));
   }
 }
-`,ue=`// Loose threads from the yarn damage field. Where a yarn is no longer interlaced with the yarns
+`,le=`// Loose threads from the yarn damage field. Where a yarn is no longer interlaced with the yarns
 // crossing it, it is a thread: picks across a ladder of worn-through warps, a bridge over an opening,
 // a lone warp across such a ladder, an end standing out of an edge. Every maximal run of such lone
 // crossings is one thread, drawn continuously from where it leaves the cloth to where it re-enters it
@@ -2943,7 +3140,7 @@ fn threadArgs() {
   threadDraw[9] = 1u;
   threadDraw[10] = 1u;
 }
-`,de=`// Loose thread geometry (threads.wgsl runs), shared by the per-run preparation and the thread and
+`,ue=`// Loose thread geometry (threads.wgsl runs), shared by the per-run preparation and the thread and
 // fibre passes. Requires module-scope R (RenderU), nodes, x, segw, tframe and nrm.
 //
 // A thread follows the mechanical lattice: its bundle (the lattice row of a pick, the column of a
@@ -3262,7 +3459,7 @@ fn runGeoAt(r: u32) -> RunGeo {
   g.tB = runGeo[RUN_GEO * r + 4u].xyz;
   return g;
 }
-`,fe=`// Per frame, per thread run (threads.wgsl): where its held ends are (the cloth they come out of,
+`,de=`// Per frame, per thread run (threads.wgsl): where its held ends are (the cloth they come out of,
 // material_map.wgsl), whether the lattice chain carries it (thread_geom.wgsl RunGeo), and where a free
 // tail beyond the chain's reach leaves it (solved by thread_tail.wgsl).
 
@@ -3417,7 +3614,7 @@ fn tailRoot(ri: RunInfo, g: RunGeo, cA: vec3<f32>, cB: vec3<f32>) -> array<vec4<
   }
   return array<vec4<f32>, 2>(vec4<f32>(q, f32(root)), vec4<f32>(dir0, 0.0));
 }
-`,pe=`// Free tails of loose threads held at one end (threads.wgsl runs; thread_prep.wgsl places their roots),
+`,fe=`// Free tails of loose threads held at one end (threads.wgsl runs; thread_prep.wgsl places their roots),
 // per frame: each solved into TAIL_SEGS + 1 points that runCenter (thread_geom.wgsl) follows.
 
 @group(0) @binding(0) var<uniform> R: RenderU;
@@ -3659,7 +3856,7 @@ fn tailSolve(ri: RunInfo, q: vec3<f32>, dir0: vec3<f32>, root: u32, k: u32, len:
     p = nxt;
   }
 }
-`,me=`// Loose threads (threads.wgsl runs, thread_geom.wgsl geometry): each chunk of a run is a ribbon
+`,pe=`// Loose threads (threads.wgsl runs, thread_geom.wgsl geometry): each chunk of a run is a ribbon
 // facing the camera around the yarn's centre line, shaded as a round fibrous cylinder with the same
 // material identity as the woven surface; fibres stand out of it and splay from untwisting free ends.
 // Threads far below a pixel are drawn at their true coverage (alpha to coverage on 4x MSAA), never
@@ -3875,7 +4072,7 @@ fn fsThreadFuzz(in: FOut) -> @location(0) vec4<f32> {
   let c = fiberShade(N, T, V, key.xyz, albedo, 0.2) * (key.w * sh) + overShade(N, T, V, albedo, 0.2, in.world, N) + F.ambient.rgb * albedo;
   return vec4<f32>(c, in.alpha);
 }
-`,he=`// The free edges' fibre (render-only, attached to its material). Each open side of an edge crossing
+`,me=`// The free edges' fibre (render-only, attached to its material). Each open side of an edge crossing
 // (pieces.wgsl edgeList, roots placed by edge_roots.wgsl) is where the yarn running across it ended.
 // Of its fibres (its linear density over a fibre's) those that slipped out of the break instead of
 // breaking at it protrude, FRAY_LEN on average; the yarns along the edge, which lost their crossings,
@@ -4324,7 +4521,7 @@ fn fsFuzz(in: VOut) -> @location(0) vec4<f32> {
   let cd = in.litD * exp(-tauX) + in.msD * exp(-diffusion(DYED_FIBRE) * tauX);
   return vec4<f32>(mix(cu, cd, cov.y), cov.x);
 }
-`,ge=`// Resolve HDR to the display: one tone map and one output encoding.
+`,he=`// Resolve HDR to the display: one tone map and one output encoding.
 
 @group(0) @binding(0) var<uniform> F: FrameU;
 @group(0) @binding(1) var hdr: texture_2d<f32>;
@@ -4362,7 +4559,7 @@ fn fsTonemap(in: FsIn) -> @location(0) vec4<f32> {
   let c = textureLoad(hdr, vec2<i32>(in.pos.xy), 0).rgb * F.params.x;
   return vec4<f32>(linearToSrgb(aces(c)), 1.0);
 }
-`,_e=`// Prefiltered weave tile: one twill repeat (R warps x R picks, unstretched, face side) per layer,
+`,ge=`// Prefiltered weave tile: one twill repeat (R warps x R picks, unstretched, face side) per layer,
 // with every mip level computed directly as the average of the analytic weave over the texel's
 // footprint. The surface shader samples it with hardware anisotropic filtering wherever the yarns
 // approach the pixel size, so the twill keeps its true filtered structure instead of aliasing.
@@ -4411,7 +4608,7 @@ fn build(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = f32(SUB * SUB);
   textureStore(tileOut, vec2<i32>(gid.xy), vec4<f32>(wf / max(covered, 1.0), aoc / n, slope / n));
 }
-`,ve=`// Edge field (render_common.wgsl): per crossing the distance to the nearest opening (a crossing
+`,_e=`// Edge field (render_common.wgsl): per crossing the distance to the nearest opening (a crossing
 // where neither yarn is part of the cloth), the intact fraction of its warp and pick, and the density of separated yarn ends around that opening,
 // written to an rgba16float texture at crossing resolution. Distances come from jump flooding over the crossing grid with physical (anisotropic)
 // pitches: nearest seeds are propagated over steps 16, 8, 4, 2, 1, 1 crossings, enough for EDGE_RMAX.
@@ -4577,7 +4774,7 @@ fn edgeWrite(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
   textureStore(edgeOut, vec2<u32>(t.k, u32(LR.edge.x) + t.m), vec4<f32>(d, warp, pick, density));
 }
-`,ye=`// Per frame, per free-edge crossing (pieces.wgsl edgeList): where its material is (material_map.wgsl),
+`,ve=`// Per frame, per free-edge crossing (pieces.wgsl edgeList): where its material is (material_map.wgsl),
 // shared by all the fibres rooted on it (fuzz.wgsl).
 
 @group(0) @binding(0) var<uniform> R: RenderU;
@@ -4607,7 +4804,7 @@ fn edgeRootsMain(@builtin(global_invocation_id) gid: vec3<u32>) {
   edgeRoots[3u * e + 1u] = vec4<f32>(mp.ds / bu, 0.0);
   edgeRoots[3u * e + 2u] = vec4<f32>(mp.dt / bv, 0.0);
 }
-`,be=`// The floor beneath the cloth: a textured dielectric (base colour, normal, roughness, AO from a
+`,ye=`// The floor beneath the cloth: a textured dielectric (base colour, normal, roughness, AO from a
 // scanned set; base colour and normal at full resolution cropped to the floor ever seen, the slowly
 // varying roughness and AO as the whole tile) lit by the key, the overhead lamp and the fill, each seen through the cloth above it.
 // The cloth's occlusion of a light comes from its shadow map prefiltered into coverage (coverage.wgsl):
@@ -4780,7 +4977,7 @@ fn fsFloor(in: VOut) -> @location(0) vec4<f32> {
   }
   return vec4<f32>(c, 1.0);
 }
-`,j=`// A shadow map prefiltered for the floor (floor.wgsl): per texel, the fraction of the shadow map's
+`,M=`// A shadow map prefiltered for the floor (floor.wgsl): per texel, the fraction of the shadow map's
 // texels it spans that hold cloth (everything drawn there is cloth above the floor), and the mean
 // cloth depth weighted the same way, then a box-filtered mip chain of both. Both are linear in the
 // covered area, so any level is the exact average over its texels.
@@ -4825,7 +5022,7 @@ fn down(@builtin(global_invocation_id) gid: vec3<u32>) {
   let s = textureLoad(covIn, p, 0) + textureLoad(covIn, p + vec2<u32>(1u, 0u), 0) + textureLoad(covIn, p + vec2<u32>(0u, 1u), 0) + textureLoad(covIn, p + vec2<u32>(1u, 1u), 0);
   textureStore(covOut, gid.xy, 0.25 * s);
 }
-`,xe=`// Floor material textures at load: mip levels by a bilinear tap at the centre of each 2 x 2 block of
+`,be=`// Floor material textures at load: mip levels by a bilinear tap at the centre of each 2 x 2 block of
 // the level above (the box average, filtered in linear space for sRGB views), and the roughness and
 // ambient occlusion maps packed into one texture.
 
@@ -4857,7 +5054,7 @@ fn fsPack(in: FsIn) -> @location(0) vec4<f32> {
   let p = vec2<i32>(in.pos.xy);
   return vec4<f32>(textureLoad(src, p, 0).r, textureLoad(src2, p, 0).r, 0.0, 1.0);
 }
-`,Se=`// The mount the coupon is stretched in: an opaque board in the cloth's plane, just beneath it, from
+`,xe=`// The mount the coupon is stretched in: an opaque board in the cloth's plane, just beneath it, from
 // under the pinned collar outward. It shades the floor beneath the cloth from the lights (they would
 // otherwise reach under the coupon's edge) and is seen only past the coupon's sides; a dark matte
 // surface lit like the floor's lights, with the cloth's shadows.
@@ -4909,9 +5106,9 @@ fn fsMount(in: VOut) -> @location(0) vec4<f32> {
   c += F.ambient.rgb * MOUNT_ALBEDO;
   return vec4<f32>(c, 1.0);
 }
-`;const Ce={target:[0,0,-.01],distance:.98,pitch:.16,yaw:0,fovY:20*Math.PI/180},we=`rgba16float`,M=4096,N=.34,Te=2048,P=.45,Ee=65536,De=16384,Oe=262144,ke=8192,Ae=`rgba16float`,je=[16,8,4,2,1,1];function F(e,t){let n=[Math.sin(e.yaw)*Math.sin(e.pitch),-Math.cos(e.yaw)*Math.sin(e.pitch),Math.cos(e.pitch)],r=[e.target[0]+n[0]*e.distance,e.target[1]+n[1]*e.distance,e.target[2]+n[2]*e.distance],i=[-Math.sin(e.yaw),Math.cos(e.yaw),0],a=A(r,e.target,i),o=ee(e.fovY,t,.05,3),s=C(o,a);return{eye:r,view:a,proj:o,viewProj:s,invViewProj:ne(s)}}function Me(e,t){let n=Math.max(...e.layers.map(e=>e.bundle[0])),r=Math.max(...e.layers.map(e=>e.bundle[1])),i=2*n+3,a=2*r+3;return[[`KAPPA_TABLE`,`u32`,`4u`],[`KAPPA_NONE`,`u32`,`0xFFFFFFFFu`],[`KAPPA_ZERO`,`u32`,`0xFFFFFFFEu`],[`KAPPA_SLOTS`,`u32`,`${De}u`],[`KAPPA_DW`,`u32`,`${4*n+3}u`],[`KAPPA_DH`,`u32`,`${4*r+3}u`],[`KAPPA_DOMAIN`,`u32`,`${(4*n+3)*(4*r+3)}u`],[`KAPPA_RW`,`u32`,`${i}u`],[`KAPPA_RH`,`u32`,`${a}u`],[`KAPPA_WORDS`,`u32`,`${Math.ceil(i*a/4)}u`],[`KAPPA_LO`,`f32`,`0.25`],[`KAPPA_HI`,`f32`,`0.75`],[`FINE_BASE`,`u32`,`4u`],[`MAX_FINE`,`u32`,`32768u`],[`FINE_QK`,`u32`,`${n+1}u`],[`FINE_QM`,`u32`,`${r+1}u`],[`MAX_EDGES`,`u32`,`${Oe}u`],[`FIBERS_PER_EDGE`,`u32`,`12u`],[`FIBRE_LIN`,`f32`,`${p}`],[`TAIL_SEGS`,`u32`,`16u`],[`TAIL_SEGS_1`,`u32`,`17u`],[`MAX_TAILS`,`u32`,`${ke}u`],[`FACE_HASH`,`bool`,`${t}`],[`FACE_CELL`,`f32`,`${b.cell}`],[`FACE_MASK`,`u32`,`${(1<<b.tableBits)-1}u`]].map(([e,t,n])=>`const ${e}: ${t} = ${n};`).join(`
+`;const Se={target:[0,0,-.01],distance:.98,pitch:.16,yaw:0,fovY:20*Math.PI/180},Ce=`rgba16float`,we=4096,N=.34,Te=2048,P=.45,Ee=65536,De=16384,Oe=262144,ke=8192,Ae=`rgba16float`,je=[16,8,4,2,1,1];function F(e,t){let n=[Math.sin(e.yaw)*Math.sin(e.pitch),-Math.cos(e.yaw)*Math.sin(e.pitch),Math.cos(e.pitch)],r=[e.target[0]+n[0]*e.distance,e.target[1]+n[1]*e.distance,e.target[2]+n[2]*e.distance],i=[-Math.sin(e.yaw),Math.cos(e.yaw),0],a=A(r,e.target,i),o=ee(e.fovY,t,.05,3),s=C(o,a);return{eye:r,view:a,proj:o,viewProj:s,invViewProj:ne(s)}}function Me(e,t){let n=Math.max(...e.layers.map(e=>e.bundle[0])),r=Math.max(...e.layers.map(e=>e.bundle[1])),i=2*n+3,a=2*r+3;return[[`KAPPA_TABLE`,`u32`,`4u`],[`KAPPA_NONE`,`u32`,`0xFFFFFFFFu`],[`KAPPA_ZERO`,`u32`,`0xFFFFFFFEu`],[`KAPPA_SLOTS`,`u32`,`${De}u`],[`KAPPA_DW`,`u32`,`${4*n+3}u`],[`KAPPA_DH`,`u32`,`${4*r+3}u`],[`KAPPA_DOMAIN`,`u32`,`${(4*n+3)*(4*r+3)}u`],[`KAPPA_RW`,`u32`,`${i}u`],[`KAPPA_RH`,`u32`,`${a}u`],[`KAPPA_WORDS`,`u32`,`${Math.ceil(i*a/4)}u`],[`KAPPA_LO`,`f32`,`0.25`],[`KAPPA_HI`,`f32`,`0.75`],[`FINE_BASE`,`u32`,`4u`],[`MAX_FINE`,`u32`,`32768u`],[`FINE_QK`,`u32`,`${n+1}u`],[`FINE_QM`,`u32`,`${r+1}u`],[`MAX_EDGES`,`u32`,`${Oe}u`],[`FIBERS_PER_EDGE`,`u32`,`12u`],[`FIBRE_LIN`,`f32`,`${p}`],[`TAIL_SEGS`,`u32`,`16u`],[`TAIL_SEGS_1`,`u32`,`17u`],[`MAX_TAILS`,`u32`,`${ke}u`],[`FACE_HASH`,`bool`,`${t}`],[`FACE_CELL`,`f32`,`${b.cell}`],[`FACE_MASK`,`u32`,`${(1<<b.tableBits)-1}u`]].map(([e,t,n])=>`const ${e}: ${t} = ${n};`).join(`
 `)+`
-`}var I=class{device;format;solver;scene;keyOffset=[-.05,.6,.3];keyIntensity=6;exposure=1;ambient=[.03,.035,.05];keyAim=[0,.12,0];keyCone=.9;background=[.002,.002,.003];overDir=D([-.03,.17,1]);overIntensity=.1;overColor=[1,.92,.82];overAngle=.065;floorZ=-.12;floorTile=2.5;floorDetailTexels=8192;frameU;frameOverU;overTex;keyCov;overCov;covGroups=[];floorGroup=null;floorLayout;mountCorners;renderU;nrm;tframe;cellFlags;lists;drawArgs;rsurf;cellCount;refinedCount;fieldCount;edgeSig;edgeArgs;threadBits;threadScratch;threadCount;runs;chunks;runGeo;threadDraw;tails;tailCount;kappa;cellDirty;piecesArgs;edgeList;edgeRoots;seedA;seedB;edgeTex;edgeSampler;edgeArgsGroup;edgeGroups=[];groups={};pipes={};cpipes={};postLayout;shadowTex;weaveTile;tileSampler;shadowSampler;dummyDepth;postGroup=null;msaaColor=null;msaaDepth=null;hdr=null;width=1;height=1;frameIndex=0;edgeRows=[];edgeSize=[1,1];constructor(e,t,n,s){this.device=e,this.format=t,this.solver=n,this.scene=s;let c=s.nodeCount,u=n.contactEnabled&&n.contact instanceof x?n.contact:null,d=Me(s,u!==null)+ie,p=0,m=0;for(let e of s.layers)p+=(e.nx-1)*(e.ny-1),m+=((e.nx-1)*2+1)*((e.ny-1)*2+1);this.cellCount=p,this.refinedCount=m,this.fieldCount=s.fieldDamage.length/2;let h=Math.max(...s.layers.map(e=>e.bundle[0])),g=Math.max(...s.layers.map(e=>e.bundle[1])),_=Math.ceil((2*h+3)*(2*g+3)/4),v=1,y=0;this.edgeRows=s.field.map(e=>{let t=y;return v=Math.max(v,e.K),y+=e.M,t}),this.edgeSize=[v,y],this.frameU=a(e,`frameU`,512,i),this.frameOverU=a(e,`frameOverU`,512,i),this.renderU=o(e,`renderU`,new Uint8Array(this.renderParams()),i);let b=new Float32Array(4*c);for(let e=0;e<c;e++)b[4*e+2]=1;this.nrm=o(e,`nrm`,b);let S=new Float32Array(8*c);for(let e=0;e<c;e++)S[8*e]=1,S[8*e+3]=s.wear[e],S[8*e+5]=1;this.tframe=o(e,`tframe`,S),this.cellFlags=a(e,`cellFlags`,4*p),this.lists=a(e,`lists`,131088),this.drawArgs=a(e,`drawArgs`,96,r|GPUBufferUsage.INDIRECT),this.rsurf=a(e,`rsurf`,48*m),this.edgeSig=a(e,`edgeSig`,16),this.edgeArgs=a(e,`edgeArgs`,64,r|GPUBufferUsage.INDIRECT),this.seedA=a(e,`edge.seedA`,4*this.fieldCount),this.seedB=a(e,`edge.seedB`,4*this.fieldCount),this.threadBits=a(e,`threadBits`,4*(Math.ceil(this.fieldCount/16)+Math.ceil(this.fieldCount/32)+1)),this.threadScratch=a(e,`threadScratch`,4*(2*Math.ceil(this.fieldCount/16)+Math.ceil(this.fieldCount/32))),this.threadCount=a(e,`threadCount`,16),this.tails=a(e,`threadTails`,272*ke),this.tailCount=a(e,`threadTailCount`,16),this.runs=a(e,`threadRuns`,16*Ee),this.chunks=a(e,`threadChunks`,1048576),this.runGeo=a(e,`threadRunGeo`,144*Ee),this.threadDraw=a(e,`threadDraw`,48,r|GPUBufferUsage.INDIRECT);let C=new Uint32Array(4+c+De+De*_+De+c);C.fill(4294967295,4,4+c),this.kappa=o(e,`kappa`,C),this.cellDirty=a(e,`cellDirty`,4*p),this.piecesArgs=a(e,`piecesArgs`,64,r|GPUBufferUsage.INDIRECT),this.edgeList=a(e,`edgeList`,1048580),this.edgeRoots=a(e,`edgeRoots`,48*Oe);let w=new f(e,`refine`,d+oe);for(let e of[`nodeFrame`,`classifyCells`,`args`,`refine`])this.cpipes[e]=w.pipeline(e);this.groups.refine=w.bindGroup(`refine`,{0:this.renderU,1:n.nodes,2:n.x,3:n.segs,5:this.nrm,6:this.cellFlags,7:this.lists,8:this.rsurf,9:this.drawArgs,10:this.tframe,11:this.kappa});let T=new f(e,`threads`,d+ue);for(let e of[`retireCount`,`threadClear`,`threadPresence`,`threadAnchor`,`threadCloth`,`threadScan`,`threadArgs`])this.cpipes[e]=T.pipeline(e);this.groups.threads=T.bindGroup(`threads`,{0:this.renderU,1:n.field,2:this.threadBits,3:this.threadCount,4:this.runs,5:this.chunks,6:this.threadDraw,7:n.x,8:n.segs,9:this.threadScratch});let E=new f(e,`pieces`,d+le);for(let e of[`piecesClear`,`cellDirtyMain`,`nodeAlloc`,`piecesArgsMain`,`kappaSolve`,`piecesArgsReset`,`edgeListMain`,`edgeDrawArgs`])this.cpipes[e]=E.pipeline(e);this.groups.pieces=E.bindGroup(`pieces`,{0:this.renderU,1:n.field,2:this.threadBits,3:n.nodes,4:n.x,5:this.kappa,6:this.cellDirty,7:this.piecesArgs,8:this.edgeList}),this.groups.piecesSolve=E.bindGroup(`pieces.solve`,{0:this.renderU,1:n.field,2:this.threadBits,3:n.nodes,4:n.x,5:this.kappa});let D=new f(e,`edgeRoots`,d+ce+ye);this.cpipes.edgeRootsMain=D.pipeline(`edgeRootsMain`),this.groups.edgeRoots=D.bindGroup(`edgeRoots`,{0:this.renderU,1:n.x,2:this.tframe,3:this.rsurf,4:this.kappa,5:this.edgeList,6:this.edgeRoots});let O=new f(e,`threadPrep`,d+de+ce+fe);this.cpipes.threadPrep=O.pipeline(`threadPrep`),this.groups.threadPrep=O.bindGroup(`threadPrep`,{0:this.renderU,1:n.x,2:n.segs,3:this.tframe,4:this.nrm,5:this.runs,6:this.threadCount,7:this.runGeo,8:this.rsurf,9:this.kappa});let k=new f(e,`threadTail`,d+pe);this.cpipes.threadTail=k.pipeline(`threadTail`),this.groups.threadTail=k.bindGroup(`threadTail`,{0:this.renderU,1:n.x,2:this.runs,3:this.threadCount,4:this.runGeo,5:this.tails,6:this.tailCount,7:n.nodes,8:u?u.cells:a(e,`noFaceCells`,16),9:u?u.items:a(e,`noFaceItems`,32)}),this.edgeTex=e.createTexture({label:`edgeField`,size:[v,y],format:Ae,usage:GPUTextureUsage.STORAGE_BINDING|GPUTextureUsage.TEXTURE_BINDING}),this.edgeSampler=e.createSampler({magFilter:`linear`,minFilter:`linear`,addressModeU:`clamp-to-edge`,addressModeV:`clamp-to-edge`});let A=GPUShaderStage.COMPUTE,ee=e.createBindGroupLayout({label:`edgeField`,entries:[{binding:0,visibility:A,buffer:{type:`uniform`}},{binding:1,visibility:A,buffer:{type:`uniform`}},{binding:2,visibility:A,buffer:{type:`read-only-storage`}},{binding:3,visibility:A,buffer:{type:`read-only-storage`}},{binding:4,visibility:A,buffer:{type:`storage`}},{binding:5,visibility:A,storageTexture:{access:`write-only`,format:Ae}},{binding:6,visibility:A,buffer:{type:`storage`}},{binding:7,visibility:A,buffer:{type:`storage`}},{binding:8,visibility:A,buffer:{type:`storage`}},{binding:9,visibility:A,buffer:{type:`read-only-storage`}},{binding:10,visibility:A,buffer:{type:`read-only-storage`}}]}),te=l(e,`edgeField`,d+ve),ne=e.createPipelineLayout({bindGroupLayouts:[ee]});for(let t of[`edgeArgsMain`,`seedInit`,`seedStep`,`edgeWrite`])this.cpipes[t]=e.createComputePipeline({label:`edgeField.${t}`,layout:ne,compute:{module:te,entryPoint:t}});let re=this.edgeTex.createView(),_e=(t,r,a,s,c,l,u)=>e.createBindGroup({label:t,layout:ee,entries:[{binding:0,resource:{buffer:this.renderU}},{binding:1,resource:{buffer:o(e,`${t}.step`,new Uint32Array([r,0,0,0]),i)}},{binding:2,resource:{buffer:n.field}},{binding:3,resource:{buffer:a}},{binding:4,resource:{buffer:s}},{binding:5,resource:re},{binding:6,resource:{buffer:u}},{binding:7,resource:{buffer:l}},{binding:8,resource:{buffer:c}},{binding:9,resource:{buffer:this.threadBits}},{binding:10,resource:{buffer:this.threadCount}}]}),j=t=>a(e,t,64);this.edgeArgsGroup=_e(`edgeField.args`,0,this.seedB,this.seedA,this.edgeArgs,n.fieldEvents,this.edgeSig),this.edgeGroups.push(_e(`edgeField.init`,0,this.seedB,this.seedA,j(`edgeField.dA`),j(`edgeField.dE`),j(`edgeField.dS`))),je.forEach((e,t)=>{let[n,r]=t%2==0?[this.seedA,this.seedB]:[this.seedB,this.seedA];this.edgeGroups.push(_e(`edgeField.step${t}`,e,n,r,j(`edgeField.dA${t}`),j(`edgeField.dE${t}`),j(`edgeField.dS${t}`)))});let xe=je.length%2==0?this.seedA:this.seedB;this.edgeGroups.push(_e(`edgeField.write`,0,xe,xe===this.seedA?this.seedB:this.seedA,j(`edgeField.dAw`),j(`edgeField.dEw`),j(`edgeField.dSw`))),this.shadowTex=e.createTexture({label:`shadowMap`,size:[M,M],format:`depth32float`,usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.TEXTURE_BINDING}),this.dummyDepth=e.createTexture({size:[1,1],format:`depth32float`,usage:GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.RENDER_ATTACHMENT}),this.shadowSampler=e.createSampler({compare:`less`,magFilter:`linear`,minFilter:`linear`}),this.overTex=e.createTexture({label:`overShadowMap`,size:[Te,Te],format:`depth32float`,usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.TEXTURE_BINDING});let Ce=(t,n)=>e.createTexture({label:t,size:[n,n],format:`rgba16float`,mipLevelCount:Math.log2(n)+1,usage:GPUTextureUsage.STORAGE_BINDING|GPUTextureUsage.TEXTURE_BINDING});this.keyCov=Ce(`keyCoverage`,M/4),this.overCov=Ce(`overCoverage`,Te/4),this.buildCoverage([[this.shadowTex,this.keyCov],[this.overTex,this.overCov]]),this.weaveTile=this.buildWeaveTile(d),this.tileSampler=e.createSampler({addressModeU:`repeat`,addressModeV:`repeat`,magFilter:`linear`,minFilter:`linear`,mipmapFilter:`linear`,maxAnisotropy:16});let N=GPUShaderStage.VERTEX,P=GPUShaderStage.FRAGMENT,F=N|P,I=(e,t=N)=>({binding:e,visibility:t,buffer:{type:`read-only-storage`}}),L=e=>({binding:e,visibility:F,buffer:{type:`uniform`}}),Ne=(e,t=P)=>[{binding:e,visibility:t,texture:{sampleType:`depth`}},{binding:e+1,visibility:t,sampler:{type:`comparison`}}],R=e.createBindGroupLayout({label:`surface`,entries:[L(0),L(1),I(2),I(3),...Ne(4),{binding:6,visibility:P,texture:{sampleType:`float`,viewDimension:`2d-array`}},{binding:7,visibility:P,sampler:{type:`filtering`}},I(8),{binding:9,visibility:P,texture:{sampleType:`float`}},{binding:10,visibility:P,sampler:{type:`filtering`}},I(11,F),I(12,F),I(13),I(14),I(15),{binding:16,visibility:P,texture:{sampleType:`depth`}}]}),Pe=e.createBindGroupLayout({label:`fuzz`,entries:[L(0),L(1),I(2),I(3),I(4),...Ne(9,F),{binding:11,visibility:F,texture:{sampleType:`depth`}}]}),Fe=e.createBindGroupLayout({label:`thread`,entries:[L(0),L(1),I(2),I(3),I(4),I(5),I(6),I(7),I(8),...Ne(9),I(11),{binding:12,visibility:P,texture:{sampleType:`depth`}}]}),z={format:`depth32float`,depthWriteEnabled:!0,depthCompare:`less`},Ie={...z,depthBias:2,depthBiasSlopeScale:2},B={count:4},Le={count:4,alphaToCoverageEnabled:!0},V={topology:`triangle-strip`,cullMode:`none`},H={topology:`triangle-list`,cullMode:`none`},Re={color:{srcFactor:`src-alpha`,dstFactor:`one-minus-src-alpha`},alpha:{srcFactor:`one`,dstFactor:`one-minus-src-alpha`}},U=(t,n,r,i,a,o,s,c)=>e.createRenderPipeline({label:t,layout:e.createPipelineLayout({bindGroupLayouts:[n]}),vertex:{module:r,entryPoint:i},fragment:a?{module:r,entryPoint:a,targets:[{format:we,blend:c}]}:void 0,primitive:o,depthStencil:s?c?{...z,depthWriteEnabled:!1}:z:Ie,multisample:s??void 0}),W=l(e,`surface`,d+ae+ce+se);this.pipes.surface=U(`surface`,R,W,`vsMain`,`fsMain`,H,B),this.pipes.surfaceShadow=U(`surface.shadow`,R,W,`vsShadow`,null,H,null),this.pipes.fine=U(`fine`,R,W,`vsFine`,`fsMain`,H,B),this.pipes.fineShadow=U(`fine.shadow`,R,W,`vsFineShadow`,null,H,null);let ze=l(e,`fuzz`,d+ae+he);this.pipes.edgeFuzz=U(`edgeFuzz`,Pe,ze,`vsEdgeFuzz`,`fsFuzz`,V,B,Re);let Be=l(e,`thread`,d+ae+de+me);this.pipes.thread=U(`thread`,Fe,Be,`vsThread`,`fsThread`,V,Le),this.pipes.threadShadow=U(`thread.shadow`,Fe,Be,`vsThreadShadow`,null,V,null),this.pipes.threadFuzz=U(`threadFuzz`,Fe,Be,`vsThreadFuzz`,`fsThreadFuzz`,V,B,Re);let G=e=>({binding:e,visibility:P,texture:{sampleType:`float`}});this.floorLayout=e.createBindGroupLayout({label:`floor`,entries:[L(0),G(1),G(2),G(3),{binding:4,visibility:P,sampler:{type:`filtering`}},G(5),G(6),{binding:7,visibility:P,sampler:{type:`filtering`}},{binding:11,visibility:P,sampler:{type:`filtering`}}]});let Ve=l(e,`floor`,d+ae+be);this.pipes.floor=U(`floor`,this.floorLayout,Ve,`vsFloor`,`fsFloor`,H,B);let He=e.createBindGroupLayout({label:`mount`,entries:[L(0),I(1),...Ne(2),{binding:4,visibility:P,texture:{sampleType:`depth`}}]}),Ue=l(e,`mount`,d+ae+Se);this.pipes.mount=U(`mount`,He,Ue,`vsMount`,`fsMount`,H,B),this.pipes.mountShadow=U(`mount.shadow`,He,Ue,`vsMountShadow`,null,H,null),this.mountCorners=o(e,`mountCorners`,this.mountGeometry());let We=this.weaveTile.createView({dimension:`2d-array`}),Ge=this.edgeTex.createView(),Ke=this.shadowTex.createView(),K=this.dummyDepth.createView(),qe=this.overTex.createView();for(let[t,r,i,a]of[[``,Ke,qe,this.frameU],[`Shadow`,K,K,this.frameU],[`Over`,K,K,this.frameOverU]])this.groups[`surface${t}`]=e.createBindGroup({layout:R,entries:[{binding:0,resource:{buffer:a}},{binding:1,resource:{buffer:this.renderU}},{binding:2,resource:{buffer:this.rsurf}},{binding:3,resource:{buffer:this.cellFlags}},{binding:4,resource:r},{binding:5,resource:this.shadowSampler},{binding:6,resource:We},{binding:7,resource:this.tileSampler},{binding:8,resource:{buffer:this.lists}},{binding:9,resource:Ge},{binding:10,resource:this.edgeSampler},{binding:11,resource:{buffer:n.field}},{binding:12,resource:{buffer:this.threadBits}},{binding:13,resource:{buffer:n.x}},{binding:14,resource:{buffer:this.tframe}},{binding:15,resource:{buffer:this.kappa}},{binding:16,resource:i}]}),this.groups[`thread${t}`]=e.createBindGroup({layout:Fe,entries:[{binding:0,resource:{buffer:a}},{binding:1,resource:{buffer:this.renderU}},{binding:2,resource:{buffer:n.x}},{binding:3,resource:{buffer:n.segs}},{binding:4,resource:{buffer:this.tframe}},{binding:5,resource:{buffer:this.nrm}},{binding:6,resource:{buffer:this.runs}},{binding:7,resource:{buffer:this.chunks}},{binding:8,resource:{buffer:this.runGeo}},{binding:11,resource:{buffer:this.tails}},{binding:9,resource:r},{binding:10,resource:this.shadowSampler},{binding:12,resource:i}]});for(let[t,n,r,i]of[[`mount`,this.frameU,Ke,qe],[`mountShadow`,this.frameU,K,K],[`mountOver`,this.frameOverU,K,K]])this.groups[t]=e.createBindGroup({layout:this.pipes.mount.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:n}},{binding:1,resource:{buffer:this.mountCorners}},{binding:2,resource:r},{binding:3,resource:this.shadowSampler},{binding:4,resource:i}]});this.groups.fuzz=e.createBindGroup({layout:Pe,entries:[{binding:0,resource:{buffer:this.frameU}},{binding:1,resource:{buffer:this.renderU}},{binding:2,resource:{buffer:this.edgeList}},{binding:3,resource:{buffer:this.edgeRoots}},{binding:4,resource:{buffer:n.field}},{binding:9,resource:Ke},{binding:10,resource:this.shadowSampler},{binding:11,resource:qe}]});let Je=l(e,`post`,d+ge);this.postLayout=e.createBindGroupLayout({label:`post`,entries:[{binding:0,visibility:P,buffer:{type:`uniform`}},{binding:1,visibility:P,texture:{sampleType:`unfilterable-float`}}]}),this.pipes.post=e.createRenderPipeline({label:`post`,layout:e.createPipelineLayout({bindGroupLayouts:[this.postLayout]}),vertex:{module:Je,entryPoint:`vsFull`},fragment:{module:Je,entryPoint:`fsTonemap`,targets:[{format:t}]},primitive:{topology:`triangle-list`}})}buildWeaveTile(e){let t=this.scene.layers.length,n=Math.log2(128)+1,r=this.device.createTexture({label:`weaveTile`,size:[128,128,t],format:`rgba16float`,mipLevelCount:n,usage:GPUTextureUsage.STORAGE_BINDING|GPUTextureUsage.TEXTURE_BINDING}),a=l(this.device,`weaveTile`,e+_e),s=this.device.createBindGroupLayout({label:`weaveTile`,entries:[{binding:0,visibility:GPUShaderStage.COMPUTE,buffer:{type:`uniform`}},{binding:1,visibility:GPUShaderStage.COMPUTE,buffer:{type:`uniform`}},{binding:2,visibility:GPUShaderStage.COMPUTE,storageTexture:{access:`write-only`,format:`rgba16float`}}]}),c=this.device.createComputePipeline({label:`weaveTile.build`,layout:this.device.createPipelineLayout({bindGroupLayouts:[s]}),compute:{module:a,entryPoint:`build`}}),u=this.device.createCommandEncoder({label:`weaveTile`}),d=u.beginComputePass();d.setPipeline(c);let f=[];for(let e=0;e<t;e++)for(let t=0;t<n;t++){let n=128>>t,a=o(this.device,`weaveTile.level`,new Uint32Array([e,n,0,0]),i);f.push(a);let c=r.createView({dimension:`2d`,baseMipLevel:t,mipLevelCount:1,baseArrayLayer:e,arrayLayerCount:1});d.setBindGroup(0,this.device.createBindGroup({layout:s,entries:[{binding:0,resource:{buffer:this.renderU}},{binding:1,resource:{buffer:a}},{binding:2,resource:c}]})),d.dispatchWorkgroups(Math.ceil(n/8),Math.ceil(n/8))}return d.end(),this.device.queue.submit([u.finish()]),this.device.queue.onSubmittedWorkDone().then(()=>f.forEach(e=>e.destroy())),r}mountGeometry(){let e=this.scene.layers[0],t=this.scene.position,n=(t,n)=>e.nodeOffset+n*e.nx+t,r=[n(1,1),n(e.nx-2,1),n(e.nx-2,e.ny-2),n(1,e.ny-2)],i=t[3*r[0]+2]-.5*e.weave.thickness,a=/* @__PURE__ */ new Float32Array(32);r.forEach((e,n)=>a.set([t[3*e],t[3*e+1],i,0],4*n));let o=1.5;return[[-1.5,-1.5],[o,-1.5],[o,o],[-1.5,o]].forEach(([e,t],n)=>a.set([e,t,i,0],16+4*n)),a}buildCoverage(e){let t=l(this.device,`coverage`,j),n=GPUShaderStage.COMPUTE,r=this.device.createBindGroupLayout({label:`coverage`,entries:[{binding:0,visibility:n,buffer:{type:`uniform`}},{binding:1,visibility:n,texture:{sampleType:`depth`}},{binding:2,visibility:n,texture:{sampleType:`unfilterable-float`}},{binding:3,visibility:n,storageTexture:{access:`write-only`,format:`rgba16float`}},{binding:4,visibility:n,sampler:{type:`non-filtering`}}]}),a=this.device.createSampler({label:`coverage.gather`}),s=this.device.createPipelineLayout({bindGroupLayouts:[r]}),c=this.device.createComputePipeline({label:`coverage.fromDepth`,layout:s,compute:{module:t,entryPoint:`fromDepth`}}),u=this.device.createComputePipeline({label:`coverage.down`,layout:s,compute:{module:t,entryPoint:`down`}}),d=o(this.device,`coverage.block`,new Uint32Array([4,0,0,0]),i),f=this.device.createTexture({size:[1,1],format:`depth32float`,usage:GPUTextureUsage.TEXTURE_BINDING}),p=this.device.createTexture({size:[1,1],format:`rgba16float`,usage:GPUTextureUsage.TEXTURE_BINDING});for(let[t,n]of e)for(let e=0;e<n.mipLevelCount;e++){let i=e=>n.createView({baseMipLevel:e,mipLevelCount:1}),o=this.device.createBindGroup({layout:r,entries:[{binding:0,resource:{buffer:d}},{binding:1,resource:(e===0?t:f).createView()},{binding:2,resource:e===0?p.createView():i(e-1)},{binding:3,resource:i(e)},{binding:4,resource:a}]});this.covGroups.push({pipe:e===0?c:u,group:o,size:n.width>>e})}}setFloorImages(e){let t=this.device,n=e=>Math.floor(Math.log2(Math.max(e.width,e.height)))+1,r=GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_DST|GPUTextureUsage.RENDER_ATTACHMENT,i=(e,n,i,a)=>{let o=t.createTexture({label:e,size:[n.width,n.height],format:i,mipLevelCount:a,usage:r});return`data`in n?t.queue.writeTexture({texture:o},n.data,{bytesPerRow:4*n.width},[n.width,n.height]):t.queue.copyExternalImageToTexture({source:n},{texture:o},[n.width,n.height]),o},a=i(`floor.base`,e.base,`rgba8unorm-srgb`,n(e.base)),o=i(`floor.normal`,e.normal,`rgba8unorm`,n(e.normal)),s=i(`floor.roughness`,e.roughness,`rgba8unorm`,1),c=i(`floor.ao`,e.ao,`rgba8unorm`,1),u=t.createTexture({label:`floor.ra`,size:[s.width,s.height],format:`rg8unorm`,mipLevelCount:n(e.roughness),usage:GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.RENDER_ATTACHMENT}),d=l(t,`mipgen`,xe),f=t.createBindGroupLayout({label:`mipgen`,entries:[{binding:0,visibility:GPUShaderStage.FRAGMENT,texture:{sampleType:`float`}},{binding:1,visibility:GPUShaderStage.FRAGMENT,texture:{sampleType:`float`}},{binding:2,visibility:GPUShaderStage.FRAGMENT,sampler:{type:`filtering`}}]}),p=t.createPipelineLayout({bindGroupLayouts:[f]}),m=/* @__PURE__ */ new Map,h=(e,n)=>{let r=`${e}.${n}`,i=m.get(r);return i||(i=t.createRenderPipeline({label:`mipgen.${r}`,layout:p,vertex:{module:d,entryPoint:`vsFull`},fragment:{module:d,entryPoint:n,targets:[{format:e}]},primitive:{topology:`triangle-list`}}),m.set(r,i)),i},g=t.createSampler({magFilter:`linear`,minFilter:`linear`}),_=t.createCommandEncoder({label:`floor.mips`}),v=(e,n,r,i,a)=>{let o=_.beginRenderPass({colorAttachments:[{view:e.createView({baseMipLevel:n,mipLevelCount:1}),loadOp:`clear`,storeOp:`store`,clearValue:{r:0,g:0,b:0,a:1}}]});o.setPipeline(h(e.format,r)),o.setBindGroup(0,t.createBindGroup({layout:f,entries:[{binding:0,resource:i},{binding:1,resource:a},{binding:2,resource:g}]})),o.draw(3),o.end()};v(u,0,`fsPack`,s.createView(),c.createView());for(let e of[a,o,u])for(let t=1;t<e.mipLevelCount;t++){let n=e.createView({baseMipLevel:t-1,mipLevelCount:1});v(e,t,`fsDown`,n,n)}t.queue.submit([_.finish()]),t.queue.onSubmittedWorkDone().then(()=>{s.destroy(),c.destroy()});let y=t.createSampler({addressModeU:`repeat`,addressModeV:`repeat`,magFilter:`linear`,minFilter:`linear`,mipmapFilter:`linear`,maxAnisotropy:16}),b=t.createSampler({magFilter:`linear`,minFilter:`linear`,mipmapFilter:`linear`}),x=t.createSampler({magFilter:`linear`,minFilter:`linear`,mipmapFilter:`linear`,maxAnisotropy:16});this.floorGroup=t.createBindGroup({label:`floor`,layout:this.floorLayout,entries:[{binding:0,resource:{buffer:this.frameU}},{binding:1,resource:a.createView()},{binding:2,resource:o.createView()},{binding:3,resource:u.createView()},{binding:4,resource:y},{binding:5,resource:this.keyCov.createView()},{binding:6,resource:this.overCov.createView()},{binding:7,resource:b},{binding:11,resource:x}]})}renderParams(){let e=/* @__PURE__ */ new ArrayBuffer(448),t=new Uint32Array(e),n=new Float32Array(e),r=this.scene;t[0]=r.nodeCount,t[1]=r.layers.length,t[2]=this.cellCount,t[3]=this.refinedCount;let i=0,a=0;return r.layers.forEach((e,o)=>{let s=(16+144*o)/4,c=e.weave;t[s]=e.nodeOffset,t[s+1]=e.nx,t[s+2]=e.ny,t[s+3]=e.bundle[0]|e.bundle[1]<<8|e.bundle[0]<<16|e.bundle[1]<<24,n[s+4]=c.pitchU,n[s+5]=c.pitchV,n[s+6]=1;let l=c.yarns[1],u=c.yarns[0];n.set([l.width,l.height,l.crimpAmplitude,.42],s+8),n.set([u.width,u.height,u.crimpAmplitude,-.38],s+12),t[s+16]=c.twillRepeat,t[s+17]=c.twillWarpOver,t[s+18]=2;let d=(e.nx-1)*2+1;t[s+20]=a,t[s+21]=d,t[s+22]=i,t[s+23]=c.id,n.set([this.edgeRows[o]??0,0,this.edgeSize[0],this.edgeSize[1]],s+24);let f=r.field[o];t.set([f.offset,f.K,f.M,0],s+28);let m=e=>Math.sqrt(e.linearDensity/(608*Math.PI));n.set([m(u),m(l),u.linearDensity/p,l.linearDensity/p],s+32),i+=(e.nx-1)*(e.ny-1),a+=d*((e.ny-1)*2+1)}),e}resetTopology(e){e.clearBuffer(this.edgeSig),e.clearBuffer(this.kappa)}resize(e,t){if(e===this.width&&t===this.height&&this.hdr)return;this.width=e,this.height=t,this.msaaColor?.destroy(),this.msaaDepth?.destroy(),this.hdr?.destroy();let n=[e,t];this.msaaColor=this.device.createTexture({label:`msaaColor`,size:n,format:we,sampleCount:4,usage:GPUTextureUsage.RENDER_ATTACHMENT}),this.msaaDepth=this.device.createTexture({label:`msaaDepth`,size:n,format:`depth32float`,sampleCount:4,usage:GPUTextureUsage.RENDER_ATTACHMENT}),this.hdr=this.device.createTexture({label:`hdr`,size:n,format:we,usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.TEXTURE_BINDING}),this.postGroup=this.device.createBindGroup({layout:this.postLayout,entries:[{binding:0,resource:{buffer:this.frameU}},{binding:1,resource:this.hdr.createView()}]})}lightMatrix(e){let t=D(w([e[0]+this.keyOffset[0],e[1]+this.keyOffset[1],e[2]+this.keyOffset[2]],e)),n=A([e[0]+t[0]*.9,e[1]+t[1]*.9,e[2]+t[2]*.9],e,Math.abs(t[2])>.95?[0,1,0]:[0,0,1]);return C(te(-.34,N,-.34,N,.3,1.2),n)}overMatrix(e){let t=D(this.overDir),n=A([e[0]+t[0],e[1]+t[1],e[2]+t[2]],e,Math.abs(t[2])>.95?[0,1,0]:[0,0,1]);return C(te(-.45,P,-.45,P,.7,1.3),n)}encode(e,t,n,r,i){let a=e=>i?{querySet:i,beginningOfPassWriteIndex:2*e,endOfPassWriteIndex:2*e+1}:void 0;if(!this.hdr||!this.msaaColor||!this.msaaDepth||!this.postGroup)return;let o=F(t,this.width/this.height),s=[t.target[0]+this.keyOffset[0],t.target[1]+this.keyOffset[1],t.target[2]+this.keyOffset[2]],c=D(w([t.target[0]+this.keyAim[0],t.target[1]+this.keyAim[1],t.target[2]+this.keyAim[2]],s)),l=/* @__PURE__ */ new Float32Array(128);l.set(o.viewProj,0),l.set(this.lightMatrix(t.target),16),l.set([...o.eye,t.fovY/this.height],32),l.set([...s,this.keyIntensity],36),l.set([...c,this.keyCone],40),l.set([...this.ambient,2*N/M],44),l.set([this.width,this.height,1/this.width,1/this.height],48);let u=Math.hypot(s[0]-t.target[0],s[1]-t.target[1],s[2]-t.target[2]);l.set([this.exposure,n,u,this.frameIndex++],52);let d=this.overMatrix(t.target),f=D(this.overDir);l.set(d,56),l.set([...f,2*P/Te],72),l.set([...this.overColor.map(e=>e*this.overIntensity),this.overAngle],76),l.set([this.floorZ,1/this.floorTile,+!!this.floorGroup,this.floorDetailTexels],80),l.set([.2490234375,.8999999999999999,2*N,M/4],84),l.set([this.overAngle,.6000000000000001,2*P,Te/4],88),this.device.queue.writeBuffer(this.frameU,0,l),l.set(d,16),l.set([t.target[0]+10*f[0],t.target[1]+10*f[1],t.target[2]+10*f[2]],36),this.device.queue.writeBuffer(this.frameOverU,0,l);let p=this.scene.nodeCount;e.clearBuffer(this.lists,0,16),e.clearBuffer(this.threadCount,8,4),e.clearBuffer(this.tailCount);let m=e.beginComputePass({label:`renderPrep`,timestampWrites:a(0)}),h=(e,t)=>{m.setPipeline(this.cpipes[e]),m.dispatchWorkgroups(t)},g=(e,t,n)=>{m.setPipeline(this.cpipes[e]),m.dispatchWorkgroupsIndirect(t,n)};m.setBindGroup(0,this.groups.threads),h(`retireCount`,Math.ceil(p/128)),m.setBindGroup(0,this.edgeArgsGroup),h(`edgeArgsMain`,1),m.setBindGroup(0,this.groups.threads);for(let e of[`threadClear`,`threadPresence`,`threadAnchor`,`threadCloth`,`threadScan`])g(e,this.edgeArgs,0);h(`threadArgs`,1),m.setBindGroup(0,this.groups.pieces),g(`piecesClear`,this.edgeArgs,16),g(`cellDirtyMain`,this.edgeArgs,32),g(`nodeAlloc`,this.edgeArgs,16),g(`piecesArgsMain`,this.edgeArgs,48),m.setBindGroup(0,this.groups.piecesSolve),g(`kappaSolve`,this.piecesArgs,0),m.setBindGroup(0,this.groups.pieces),h(`piecesArgsReset`,1),g(`edgeListMain`,this.edgeArgs,0),g(`edgeDrawArgs`,this.edgeArgs,48),this.edgeGroups.forEach((e,t)=>{m.setBindGroup(0,e),g(t===0?`seedInit`:t===this.edgeGroups.length-1?`edgeWrite`:`seedStep`,this.edgeArgs,0)}),m.setBindGroup(0,this.groups.refine),h(`nodeFrame`,Math.ceil(p/128)),h(`classifyCells`,Math.ceil(p/128)),h(`args`,1),h(`refine`,Math.ceil(this.refinedCount/128)),m.setBindGroup(0,this.groups.threadPrep),g(`threadPrep`,this.threadDraw,32),m.setBindGroup(0,this.groups.threadTail),g(`threadTail`,this.threadDraw,32),m.setBindGroup(0,this.groups.edgeRoots),g(`edgeRootsMain`,this.piecesArgs,32),m.end();let _=e.beginRenderPass({label:`shadow`,timestampWrites:a(1),colorAttachments:[],depthStencilAttachment:{view:this.shadowTex.createView(),depthClearValue:1,depthLoadOp:`clear`,depthStoreOp:`store`}});_.setBindGroup(0,this.groups.surfaceShadow),_.setPipeline(this.pipes.surfaceShadow),_.draw(24,this.cellCount),_.setPipeline(this.pipes.fineShadow),_.drawIndirect(this.drawArgs,64),_.setBindGroup(0,this.groups.threadShadow),_.setPipeline(this.pipes.threadShadow),_.drawIndirect(this.threadDraw,0),_.setBindGroup(0,this.groups.mountShadow),_.setPipeline(this.pipes.mountShadow),_.draw(24),_.end();let v=e.beginRenderPass({label:`overShadow`,colorAttachments:[],depthStencilAttachment:{view:this.overTex.createView(),depthClearValue:1,depthLoadOp:`clear`,depthStoreOp:`store`}});if(v.setBindGroup(0,this.groups.surfaceOver),v.setPipeline(this.pipes.surfaceShadow),v.draw(24,this.cellCount),v.setPipeline(this.pipes.fineShadow),v.drawIndirect(this.drawArgs,64),v.setBindGroup(0,this.groups.threadOver),v.setPipeline(this.pipes.threadShadow),v.drawIndirect(this.threadDraw,0),v.setBindGroup(0,this.groups.mountOver),v.setPipeline(this.pipes.mountShadow),v.draw(24),v.end(),this.floorGroup){let t=e.beginComputePass({label:`floorCoverage`});for(let e of this.covGroups)t.setPipeline(e.pipe),t.setBindGroup(0,e.group),t.dispatchWorkgroups(Math.ceil(e.size/8),Math.ceil(e.size/8));t.end()}let y=e.beginRenderPass({label:`main`,timestampWrites:a(2),colorAttachments:[{view:this.msaaColor.createView(),resolveTarget:this.hdr.createView(),clearValue:{r:this.background[0],g:this.background[1],b:this.background[2],a:1},loadOp:`clear`,storeOp:`discard`}],depthStencilAttachment:{view:this.msaaDepth.createView(),depthClearValue:1,depthLoadOp:`clear`,depthStoreOp:`discard`}});y.setBindGroup(0,this.groups.surface),y.setPipeline(this.pipes.surface),y.draw(24,this.cellCount),y.setPipeline(this.pipes.fine),y.drawIndirect(this.drawArgs,64),y.setBindGroup(0,this.groups.thread),y.setPipeline(this.pipes.thread),y.drawIndirect(this.threadDraw,0),y.setBindGroup(0,this.groups.mount),y.setPipeline(this.pipes.mount),y.draw(24),this.floorGroup&&(y.setBindGroup(0,this.floorGroup),y.setPipeline(this.pipes.floor),y.draw(6)),y.setBindGroup(0,this.groups.thread),y.setPipeline(this.pipes.threadFuzz),y.drawIndirect(this.threadDraw,16),y.setBindGroup(0,this.groups.fuzz),y.setPipeline(this.pipes.edgeFuzz),y.drawIndirect(this.piecesArgs,16),y.end();let b=e.beginRenderPass({label:`post`,timestampWrites:a(3),colorAttachments:[{view:r,loadOp:`clear`,storeOp:`store`,clearValue:{r:0,g:0,b:0,a:1}}]});b.setPipeline(this.pipes.post),b.setBindGroup(0,this.postGroup),b.draw(3),b.end()}};const L={radius:.008,maxForce:120,maxLead:.006,pinch:.3,engageTime:.15};function Ne(e){let t=Math.min(1,Math.max(0,e/L.engageTime));return 1-(1-L.pinch)*t*t*(3-2*t)}function R(e,t,n=()=>!0){let r=e.layers.find(e=>t>=e.nodeOffset&&t<e.nodeOffset+e.nodeCount);if(!r)return null;let i=e.restUV[2*t],a=e.restUV[2*t+1],o=L.radius,s=r.material,c=Math.ceil(o/s.pitchU),l=Math.ceil(o/s.pitchV),u=t-r.nodeOffset,d=u%r.nx,f=Math.floor(u/r.nx),p=[],m=[],h=0;for(let t=Math.max(0,f-l);t<=Math.min(r.ny-1,f+l);t++)for(let s=Math.max(0,d-c);s<=Math.min(r.nx-1,d+c);s++){let c=r.nodeOffset+t*r.nx+s;if(e.pinned[c]||!n(c))continue;let l=Math.hypot(e.restUV[2*c]-i,e.restUV[2*c+1]-a)/o;if(l>=1)continue;let u=l<.5?1:1-(l-.5)/.5,d=u*u*(3-2*u);d<=.001||(p.push(c),m.push(d),h+=d)}return p.length===0?null:{nodes:p,weights:m,stiffness:L.maxForce/(L.maxLead*h)}}var Pe=`// Picking and grip terms. A grip is a finite material patch attached to a handle by quadratic
+`}var I=class{device;format;solver;scene;keyOffset=[-.05,.6,.3];keyIntensity=6;exposure=1;ambient=[.03,.035,.05];keyAim=[0,.12,0];keyCone=.9;background=[.002,.002,.003];overDir=D([-.03,.17,1]);overIntensity=.1;overColor=[1,.92,.82];overAngle=.065;floorZ=-.12;floorTile=2.5;floorDetailTexels=8192;frameU;frameOverU;overTex;keyCov;overCov;covGroups=[];floorGroup=null;floorLayout;mountCorners;renderU;nrm;tframe;cellFlags;lists;drawArgs;rsurf;cellCount;refinedCount;fieldCount;edgeSig;edgeArgs;threadBits;threadScratch;threadCount;runs;chunks;runGeo;threadDraw;tails;tailCount;kappa;cellDirty;piecesArgs;edgeList;edgeRoots;seedA;seedB;edgeTex;edgeSampler;edgeArgsGroup;edgeGroups=[];groups={};pipes={};cpipes={};postLayout;shadowTex;weaveTile;tileSampler;shadowSampler;dummyDepth;postGroup=null;msaaColor=null;msaaDepth=null;hdr=null;width=1;height=1;frameIndex=0;edgeRows=[];edgeSize=[1,1];constructor(e,t,n,s){this.device=e,this.format=t,this.solver=n,this.scene=s;let c=s.nodeCount,u=n.contactEnabled&&n.contact instanceof x?n.contact:null,d=Me(s,u!==null)+re,p=0,m=0;for(let e of s.layers)p+=(e.nx-1)*(e.ny-1),m+=((e.nx-1)*2+1)*((e.ny-1)*2+1);this.cellCount=p,this.refinedCount=m,this.fieldCount=s.fieldDamage.length/2;let h=Math.max(...s.layers.map(e=>e.bundle[0])),g=Math.max(...s.layers.map(e=>e.bundle[1])),_=Math.ceil((2*h+3)*(2*g+3)/4),v=1,y=0;this.edgeRows=s.field.map(e=>{let t=y;return v=Math.max(v,e.K),y+=e.M,t}),this.edgeSize=[v,y],this.frameU=a(e,`frameU`,512,i),this.frameOverU=a(e,`frameOverU`,512,i),this.renderU=o(e,`renderU`,new Uint8Array(this.renderParams()),i);let b=new Float32Array(4*c);for(let e=0;e<c;e++)b[4*e+2]=1;this.nrm=o(e,`nrm`,b);let S=new Float32Array(8*c);for(let e=0;e<c;e++)S[8*e]=1,S[8*e+3]=s.wear[e],S[8*e+5]=1;this.tframe=o(e,`tframe`,S),this.cellFlags=a(e,`cellFlags`,4*p),this.lists=a(e,`lists`,131088),this.drawArgs=a(e,`drawArgs`,96,r|GPUBufferUsage.INDIRECT),this.rsurf=a(e,`rsurf`,48*m),this.edgeSig=a(e,`edgeSig`,16),this.edgeArgs=a(e,`edgeArgs`,64,r|GPUBufferUsage.INDIRECT),this.seedA=a(e,`edge.seedA`,4*this.fieldCount),this.seedB=a(e,`edge.seedB`,4*this.fieldCount),this.threadBits=a(e,`threadBits`,4*(Math.ceil(this.fieldCount/16)+Math.ceil(this.fieldCount/32)+1)),this.threadScratch=a(e,`threadScratch`,4*(2*Math.ceil(this.fieldCount/16)+Math.ceil(this.fieldCount/32))),this.threadCount=a(e,`threadCount`,16),this.tails=a(e,`threadTails`,272*ke),this.tailCount=a(e,`threadTailCount`,16),this.runs=a(e,`threadRuns`,16*Ee),this.chunks=a(e,`threadChunks`,1048576),this.runGeo=a(e,`threadRunGeo`,144*Ee),this.threadDraw=a(e,`threadDraw`,48,r|GPUBufferUsage.INDIRECT);let C=new Uint32Array(4+c+De+De*_+De+c);C.fill(4294967295,4,4+c),this.kappa=o(e,`kappa`,C),this.cellDirty=a(e,`cellDirty`,4*p),this.piecesArgs=a(e,`piecesArgs`,64,r|GPUBufferUsage.INDIRECT),this.edgeList=a(e,`edgeList`,1048580),this.edgeRoots=a(e,`edgeRoots`,48*Oe);let w=new f(e,`refine`,d+ae);for(let e of[`nodeFrame`,`classifyCells`,`args`,`refine`])this.cpipes[e]=w.pipeline(e);this.groups.refine=w.bindGroup(`refine`,{0:this.renderU,1:n.nodes,2:n.x,3:n.segs,5:this.nrm,6:this.cellFlags,7:this.lists,8:this.rsurf,9:this.drawArgs,10:this.tframe,11:this.kappa});let T=new f(e,`threads`,d+le);for(let e of[`retireCount`,`threadClear`,`threadPresence`,`threadAnchor`,`threadCloth`,`threadScan`,`threadArgs`])this.cpipes[e]=T.pipeline(e);this.groups.threads=T.bindGroup(`threads`,{0:this.renderU,1:n.field,2:this.threadBits,3:this.threadCount,4:this.runs,5:this.chunks,6:this.threadDraw,7:n.x,8:n.segs,9:this.threadScratch});let E=new f(e,`pieces`,d+ce);for(let e of[`piecesClear`,`cellDirtyMain`,`nodeAlloc`,`piecesArgsMain`,`kappaSolve`,`piecesArgsReset`,`edgeListMain`,`edgeDrawArgs`])this.cpipes[e]=E.pipeline(e);this.groups.pieces=E.bindGroup(`pieces`,{0:this.renderU,1:n.field,2:this.threadBits,3:n.nodes,4:n.x,5:this.kappa,6:this.cellDirty,7:this.piecesArgs,8:this.edgeList}),this.groups.piecesSolve=E.bindGroup(`pieces.solve`,{0:this.renderU,1:n.field,2:this.threadBits,3:n.nodes,4:n.x,5:this.kappa});let D=new f(e,`edgeRoots`,d+se+ve);this.cpipes.edgeRootsMain=D.pipeline(`edgeRootsMain`),this.groups.edgeRoots=D.bindGroup(`edgeRoots`,{0:this.renderU,1:n.x,2:this.tframe,3:this.rsurf,4:this.kappa,5:this.edgeList,6:this.edgeRoots});let O=new f(e,`threadPrep`,d+ue+se+de);this.cpipes.threadPrep=O.pipeline(`threadPrep`),this.groups.threadPrep=O.bindGroup(`threadPrep`,{0:this.renderU,1:n.x,2:n.segs,3:this.tframe,4:this.nrm,5:this.runs,6:this.threadCount,7:this.runGeo,8:this.rsurf,9:this.kappa});let k=new f(e,`threadTail`,d+fe);this.cpipes.threadTail=k.pipeline(`threadTail`),this.groups.threadTail=k.bindGroup(`threadTail`,{0:this.renderU,1:n.x,2:this.runs,3:this.threadCount,4:this.runGeo,5:this.tails,6:this.tailCount,7:n.nodes,8:u?u.cells:a(e,`noFaceCells`,16),9:u?u.items:a(e,`noFaceItems`,32)}),this.edgeTex=e.createTexture({label:`edgeField`,size:[v,y],format:Ae,usage:GPUTextureUsage.STORAGE_BINDING|GPUTextureUsage.TEXTURE_BINDING}),this.edgeSampler=e.createSampler({magFilter:`linear`,minFilter:`linear`,addressModeU:`clamp-to-edge`,addressModeV:`clamp-to-edge`});let A=GPUShaderStage.COMPUTE,ee=e.createBindGroupLayout({label:`edgeField`,entries:[{binding:0,visibility:A,buffer:{type:`uniform`}},{binding:1,visibility:A,buffer:{type:`uniform`}},{binding:2,visibility:A,buffer:{type:`read-only-storage`}},{binding:3,visibility:A,buffer:{type:`read-only-storage`}},{binding:4,visibility:A,buffer:{type:`storage`}},{binding:5,visibility:A,storageTexture:{access:`write-only`,format:Ae}},{binding:6,visibility:A,buffer:{type:`storage`}},{binding:7,visibility:A,buffer:{type:`storage`}},{binding:8,visibility:A,buffer:{type:`storage`}},{binding:9,visibility:A,buffer:{type:`read-only-storage`}},{binding:10,visibility:A,buffer:{type:`read-only-storage`}}]}),te=l(e,`edgeField`,d+_e),ne=e.createPipelineLayout({bindGroupLayouts:[ee]});for(let t of[`edgeArgsMain`,`seedInit`,`seedStep`,`edgeWrite`])this.cpipes[t]=e.createComputePipeline({label:`edgeField.${t}`,layout:ne,compute:{module:te,entryPoint:t}});let j=this.edgeTex.createView(),ge=(t,r,a,s,c,l,u)=>e.createBindGroup({label:t,layout:ee,entries:[{binding:0,resource:{buffer:this.renderU}},{binding:1,resource:{buffer:o(e,`${t}.step`,new Uint32Array([r,0,0,0]),i)}},{binding:2,resource:{buffer:n.field}},{binding:3,resource:{buffer:a}},{binding:4,resource:{buffer:s}},{binding:5,resource:j},{binding:6,resource:{buffer:u}},{binding:7,resource:{buffer:l}},{binding:8,resource:{buffer:c}},{binding:9,resource:{buffer:this.threadBits}},{binding:10,resource:{buffer:this.threadCount}}]}),M=t=>a(e,t,64);this.edgeArgsGroup=ge(`edgeField.args`,0,this.seedB,this.seedA,this.edgeArgs,n.fieldEvents,this.edgeSig),this.edgeGroups.push(ge(`edgeField.init`,0,this.seedB,this.seedA,M(`edgeField.dA`),M(`edgeField.dE`),M(`edgeField.dS`))),je.forEach((e,t)=>{let[n,r]=t%2==0?[this.seedA,this.seedB]:[this.seedB,this.seedA];this.edgeGroups.push(ge(`edgeField.step${t}`,e,n,r,M(`edgeField.dA${t}`),M(`edgeField.dE${t}`),M(`edgeField.dS${t}`)))});let be=je.length%2==0?this.seedA:this.seedB;this.edgeGroups.push(ge(`edgeField.write`,0,be,be===this.seedA?this.seedB:this.seedA,M(`edgeField.dAw`),M(`edgeField.dEw`),M(`edgeField.dSw`))),this.shadowTex=e.createTexture({label:`shadowMap`,size:[we,we],format:`depth32float`,usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.TEXTURE_BINDING}),this.dummyDepth=e.createTexture({size:[1,1],format:`depth32float`,usage:GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.RENDER_ATTACHMENT}),this.shadowSampler=e.createSampler({compare:`less`,magFilter:`linear`,minFilter:`linear`}),this.overTex=e.createTexture({label:`overShadowMap`,size:[Te,Te],format:`depth32float`,usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.TEXTURE_BINDING});let Se=(t,n)=>e.createTexture({label:t,size:[n,n],format:`rgba16float`,mipLevelCount:Math.log2(n)+1,usage:GPUTextureUsage.STORAGE_BINDING|GPUTextureUsage.TEXTURE_BINDING});this.keyCov=Se(`keyCoverage`,we/4),this.overCov=Se(`overCoverage`,Te/4),this.buildCoverage([[this.shadowTex,this.keyCov],[this.overTex,this.overCov]]),this.weaveTile=this.buildWeaveTile(d),this.tileSampler=e.createSampler({addressModeU:`repeat`,addressModeV:`repeat`,magFilter:`linear`,minFilter:`linear`,mipmapFilter:`linear`,maxAnisotropy:16});let N=GPUShaderStage.VERTEX,P=GPUShaderStage.FRAGMENT,F=N|P,I=(e,t=N)=>({binding:e,visibility:t,buffer:{type:`read-only-storage`}}),L=e=>({binding:e,visibility:F,buffer:{type:`uniform`}}),R=(e,t=P)=>[{binding:e,visibility:t,texture:{sampleType:`depth`}},{binding:e+1,visibility:t,sampler:{type:`comparison`}}],z=e.createBindGroupLayout({label:`surface`,entries:[L(0),L(1),I(2),I(3),...R(4),{binding:6,visibility:P,texture:{sampleType:`float`,viewDimension:`2d-array`}},{binding:7,visibility:P,sampler:{type:`filtering`}},I(8),{binding:9,visibility:P,texture:{sampleType:`float`}},{binding:10,visibility:P,sampler:{type:`filtering`}},I(11,F),I(12,F),I(13),I(14),I(15),{binding:16,visibility:P,texture:{sampleType:`depth`}}]}),Ne=e.createBindGroupLayout({label:`fuzz`,entries:[L(0),L(1),I(2),I(3),I(4),...R(9,F),{binding:11,visibility:F,texture:{sampleType:`depth`}}]}),Pe=e.createBindGroupLayout({label:`thread`,entries:[L(0),L(1),I(2),I(3),I(4),I(5),I(6),I(7),I(8),...R(9),I(11),{binding:12,visibility:P,texture:{sampleType:`depth`}}]}),Fe={format:`depth32float`,depthWriteEnabled:!0,depthCompare:`less`},Ie={...Fe,depthBias:2,depthBiasSlopeScale:2},B={count:4},Le={count:4,alphaToCoverageEnabled:!0},V={topology:`triangle-strip`,cullMode:`none`},H={topology:`triangle-list`,cullMode:`none`},Re={color:{srcFactor:`src-alpha`,dstFactor:`one-minus-src-alpha`},alpha:{srcFactor:`one`,dstFactor:`one-minus-src-alpha`}},U=(t,n,r,i,a,o,s,c)=>e.createRenderPipeline({label:t,layout:e.createPipelineLayout({bindGroupLayouts:[n]}),vertex:{module:r,entryPoint:i},fragment:a?{module:r,entryPoint:a,targets:[{format:Ce,blend:c}]}:void 0,primitive:o,depthStencil:s?c?{...Fe,depthWriteEnabled:!1}:Fe:Ie,multisample:s??void 0}),W=l(e,`surface`,d+ie+se+oe);this.pipes.surface=U(`surface`,z,W,`vsMain`,`fsMain`,H,B),this.pipes.surfaceShadow=U(`surface.shadow`,z,W,`vsShadow`,null,H,null),this.pipes.fine=U(`fine`,z,W,`vsFine`,`fsMain`,H,B),this.pipes.fineShadow=U(`fine.shadow`,z,W,`vsFineShadow`,null,H,null);let ze=l(e,`fuzz`,d+ie+me);this.pipes.edgeFuzz=U(`edgeFuzz`,Ne,ze,`vsEdgeFuzz`,`fsFuzz`,V,B,Re);let Be=l(e,`thread`,d+ie+ue+pe);this.pipes.thread=U(`thread`,Pe,Be,`vsThread`,`fsThread`,V,Le),this.pipes.threadShadow=U(`thread.shadow`,Pe,Be,`vsThreadShadow`,null,V,null),this.pipes.threadFuzz=U(`threadFuzz`,Pe,Be,`vsThreadFuzz`,`fsThreadFuzz`,V,B,Re);let G=e=>({binding:e,visibility:P,texture:{sampleType:`float`}});this.floorLayout=e.createBindGroupLayout({label:`floor`,entries:[L(0),G(1),G(2),G(3),{binding:4,visibility:P,sampler:{type:`filtering`}},G(5),G(6),{binding:7,visibility:P,sampler:{type:`filtering`}},{binding:11,visibility:P,sampler:{type:`filtering`}}]});let Ve=l(e,`floor`,d+ie+ye);this.pipes.floor=U(`floor`,this.floorLayout,Ve,`vsFloor`,`fsFloor`,H,B);let He=e.createBindGroupLayout({label:`mount`,entries:[L(0),I(1),...R(2),{binding:4,visibility:P,texture:{sampleType:`depth`}}]}),Ue=l(e,`mount`,d+ie+xe);this.pipes.mount=U(`mount`,He,Ue,`vsMount`,`fsMount`,H,B),this.pipes.mountShadow=U(`mount.shadow`,He,Ue,`vsMountShadow`,null,H,null),this.mountCorners=o(e,`mountCorners`,this.mountGeometry());let We=this.weaveTile.createView({dimension:`2d-array`}),Ge=this.edgeTex.createView(),Ke=this.shadowTex.createView(),K=this.dummyDepth.createView(),qe=this.overTex.createView();for(let[t,r,i,a]of[[``,Ke,qe,this.frameU],[`Shadow`,K,K,this.frameU],[`Over`,K,K,this.frameOverU]])this.groups[`surface${t}`]=e.createBindGroup({layout:z,entries:[{binding:0,resource:{buffer:a}},{binding:1,resource:{buffer:this.renderU}},{binding:2,resource:{buffer:this.rsurf}},{binding:3,resource:{buffer:this.cellFlags}},{binding:4,resource:r},{binding:5,resource:this.shadowSampler},{binding:6,resource:We},{binding:7,resource:this.tileSampler},{binding:8,resource:{buffer:this.lists}},{binding:9,resource:Ge},{binding:10,resource:this.edgeSampler},{binding:11,resource:{buffer:n.field}},{binding:12,resource:{buffer:this.threadBits}},{binding:13,resource:{buffer:n.x}},{binding:14,resource:{buffer:this.tframe}},{binding:15,resource:{buffer:this.kappa}},{binding:16,resource:i}]}),this.groups[`thread${t}`]=e.createBindGroup({layout:Pe,entries:[{binding:0,resource:{buffer:a}},{binding:1,resource:{buffer:this.renderU}},{binding:2,resource:{buffer:n.x}},{binding:3,resource:{buffer:n.segs}},{binding:4,resource:{buffer:this.tframe}},{binding:5,resource:{buffer:this.nrm}},{binding:6,resource:{buffer:this.runs}},{binding:7,resource:{buffer:this.chunks}},{binding:8,resource:{buffer:this.runGeo}},{binding:11,resource:{buffer:this.tails}},{binding:9,resource:r},{binding:10,resource:this.shadowSampler},{binding:12,resource:i}]});for(let[t,n,r,i]of[[`mount`,this.frameU,Ke,qe],[`mountShadow`,this.frameU,K,K],[`mountOver`,this.frameOverU,K,K]])this.groups[t]=e.createBindGroup({layout:this.pipes.mount.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:n}},{binding:1,resource:{buffer:this.mountCorners}},{binding:2,resource:r},{binding:3,resource:this.shadowSampler},{binding:4,resource:i}]});this.groups.fuzz=e.createBindGroup({layout:Ne,entries:[{binding:0,resource:{buffer:this.frameU}},{binding:1,resource:{buffer:this.renderU}},{binding:2,resource:{buffer:this.edgeList}},{binding:3,resource:{buffer:this.edgeRoots}},{binding:4,resource:{buffer:n.field}},{binding:9,resource:Ke},{binding:10,resource:this.shadowSampler},{binding:11,resource:qe}]});let Je=l(e,`post`,d+he);this.postLayout=e.createBindGroupLayout({label:`post`,entries:[{binding:0,visibility:P,buffer:{type:`uniform`}},{binding:1,visibility:P,texture:{sampleType:`unfilterable-float`}}]}),this.pipes.post=e.createRenderPipeline({label:`post`,layout:e.createPipelineLayout({bindGroupLayouts:[this.postLayout]}),vertex:{module:Je,entryPoint:`vsFull`},fragment:{module:Je,entryPoint:`fsTonemap`,targets:[{format:t}]},primitive:{topology:`triangle-list`}})}buildWeaveTile(e){let t=this.scene.layers.length,n=Math.log2(128)+1,r=this.device.createTexture({label:`weaveTile`,size:[128,128,t],format:`rgba16float`,mipLevelCount:n,usage:GPUTextureUsage.STORAGE_BINDING|GPUTextureUsage.TEXTURE_BINDING}),a=l(this.device,`weaveTile`,e+ge),s=this.device.createBindGroupLayout({label:`weaveTile`,entries:[{binding:0,visibility:GPUShaderStage.COMPUTE,buffer:{type:`uniform`}},{binding:1,visibility:GPUShaderStage.COMPUTE,buffer:{type:`uniform`}},{binding:2,visibility:GPUShaderStage.COMPUTE,storageTexture:{access:`write-only`,format:`rgba16float`}}]}),c=this.device.createComputePipeline({label:`weaveTile.build`,layout:this.device.createPipelineLayout({bindGroupLayouts:[s]}),compute:{module:a,entryPoint:`build`}}),u=this.device.createCommandEncoder({label:`weaveTile`}),d=u.beginComputePass();d.setPipeline(c);let f=[];for(let e=0;e<t;e++)for(let t=0;t<n;t++){let n=128>>t,a=o(this.device,`weaveTile.level`,new Uint32Array([e,n,0,0]),i);f.push(a);let c=r.createView({dimension:`2d`,baseMipLevel:t,mipLevelCount:1,baseArrayLayer:e,arrayLayerCount:1});d.setBindGroup(0,this.device.createBindGroup({layout:s,entries:[{binding:0,resource:{buffer:this.renderU}},{binding:1,resource:{buffer:a}},{binding:2,resource:c}]})),d.dispatchWorkgroups(Math.ceil(n/8),Math.ceil(n/8))}return d.end(),this.device.queue.submit([u.finish()]),this.device.queue.onSubmittedWorkDone().then(()=>f.forEach(e=>e.destroy())),r}mountGeometry(){let e=this.scene.layers[0],t=this.scene.position,n=(t,n)=>e.nodeOffset+n*e.nx+t,r=[n(1,1),n(e.nx-2,1),n(e.nx-2,e.ny-2),n(1,e.ny-2)],i=t[3*r[0]+2]-.5*e.weave.thickness,a=/* @__PURE__ */ new Float32Array(32);r.forEach((e,n)=>a.set([t[3*e],t[3*e+1],i,0],4*n));let o=1.5;return[[-1.5,-1.5],[o,-1.5],[o,o],[-1.5,o]].forEach(([e,t],n)=>a.set([e,t,i,0],16+4*n)),a}buildCoverage(e){let t=l(this.device,`coverage`,M),n=GPUShaderStage.COMPUTE,r=this.device.createBindGroupLayout({label:`coverage`,entries:[{binding:0,visibility:n,buffer:{type:`uniform`}},{binding:1,visibility:n,texture:{sampleType:`depth`}},{binding:2,visibility:n,texture:{sampleType:`unfilterable-float`}},{binding:3,visibility:n,storageTexture:{access:`write-only`,format:`rgba16float`}},{binding:4,visibility:n,sampler:{type:`non-filtering`}}]}),a=this.device.createSampler({label:`coverage.gather`}),s=this.device.createPipelineLayout({bindGroupLayouts:[r]}),c=this.device.createComputePipeline({label:`coverage.fromDepth`,layout:s,compute:{module:t,entryPoint:`fromDepth`}}),u=this.device.createComputePipeline({label:`coverage.down`,layout:s,compute:{module:t,entryPoint:`down`}}),d=o(this.device,`coverage.block`,new Uint32Array([4,0,0,0]),i),f=this.device.createTexture({size:[1,1],format:`depth32float`,usage:GPUTextureUsage.TEXTURE_BINDING}),p=this.device.createTexture({size:[1,1],format:`rgba16float`,usage:GPUTextureUsage.TEXTURE_BINDING});for(let[t,n]of e)for(let e=0;e<n.mipLevelCount;e++){let i=e=>n.createView({baseMipLevel:e,mipLevelCount:1}),o=this.device.createBindGroup({layout:r,entries:[{binding:0,resource:{buffer:d}},{binding:1,resource:(e===0?t:f).createView()},{binding:2,resource:e===0?p.createView():i(e-1)},{binding:3,resource:i(e)},{binding:4,resource:a}]});this.covGroups.push({pipe:e===0?c:u,group:o,size:n.width>>e})}}setFloorImages(e){let t=this.device,n=e=>Math.floor(Math.log2(Math.max(e.width,e.height)))+1,r=GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_DST|GPUTextureUsage.RENDER_ATTACHMENT,i=(e,n,i,a)=>{let o=t.createTexture({label:e,size:[n.width,n.height],format:i,mipLevelCount:a,usage:r});return`data`in n?t.queue.writeTexture({texture:o},n.data,{bytesPerRow:4*n.width},[n.width,n.height]):t.queue.copyExternalImageToTexture({source:n},{texture:o},[n.width,n.height]),o},a=i(`floor.base`,e.base,`rgba8unorm-srgb`,n(e.base)),o=i(`floor.normal`,e.normal,`rgba8unorm`,n(e.normal)),s=i(`floor.roughness`,e.roughness,`rgba8unorm`,1),c=i(`floor.ao`,e.ao,`rgba8unorm`,1),u=t.createTexture({label:`floor.ra`,size:[s.width,s.height],format:`rg8unorm`,mipLevelCount:n(e.roughness),usage:GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.RENDER_ATTACHMENT}),d=l(t,`mipgen`,be),f=t.createBindGroupLayout({label:`mipgen`,entries:[{binding:0,visibility:GPUShaderStage.FRAGMENT,texture:{sampleType:`float`}},{binding:1,visibility:GPUShaderStage.FRAGMENT,texture:{sampleType:`float`}},{binding:2,visibility:GPUShaderStage.FRAGMENT,sampler:{type:`filtering`}}]}),p=t.createPipelineLayout({bindGroupLayouts:[f]}),m=/* @__PURE__ */ new Map,h=(e,n)=>{let r=`${e}.${n}`,i=m.get(r);return i||(i=t.createRenderPipeline({label:`mipgen.${r}`,layout:p,vertex:{module:d,entryPoint:`vsFull`},fragment:{module:d,entryPoint:n,targets:[{format:e}]},primitive:{topology:`triangle-list`}}),m.set(r,i)),i},g=t.createSampler({magFilter:`linear`,minFilter:`linear`}),_=t.createCommandEncoder({label:`floor.mips`}),v=(e,n,r,i,a)=>{let o=_.beginRenderPass({colorAttachments:[{view:e.createView({baseMipLevel:n,mipLevelCount:1}),loadOp:`clear`,storeOp:`store`,clearValue:{r:0,g:0,b:0,a:1}}]});o.setPipeline(h(e.format,r)),o.setBindGroup(0,t.createBindGroup({layout:f,entries:[{binding:0,resource:i},{binding:1,resource:a},{binding:2,resource:g}]})),o.draw(3),o.end()};v(u,0,`fsPack`,s.createView(),c.createView());for(let e of[a,o,u])for(let t=1;t<e.mipLevelCount;t++){let n=e.createView({baseMipLevel:t-1,mipLevelCount:1});v(e,t,`fsDown`,n,n)}t.queue.submit([_.finish()]),t.queue.onSubmittedWorkDone().then(()=>{s.destroy(),c.destroy()});let y=t.createSampler({addressModeU:`repeat`,addressModeV:`repeat`,magFilter:`linear`,minFilter:`linear`,mipmapFilter:`linear`,maxAnisotropy:16}),b=t.createSampler({magFilter:`linear`,minFilter:`linear`,mipmapFilter:`linear`}),x=t.createSampler({magFilter:`linear`,minFilter:`linear`,mipmapFilter:`linear`,maxAnisotropy:16});this.floorGroup=t.createBindGroup({label:`floor`,layout:this.floorLayout,entries:[{binding:0,resource:{buffer:this.frameU}},{binding:1,resource:a.createView()},{binding:2,resource:o.createView()},{binding:3,resource:u.createView()},{binding:4,resource:y},{binding:5,resource:this.keyCov.createView()},{binding:6,resource:this.overCov.createView()},{binding:7,resource:b},{binding:11,resource:x}]})}renderParams(){let e=/* @__PURE__ */ new ArrayBuffer(448),t=new Uint32Array(e),n=new Float32Array(e),r=this.scene;t[0]=r.nodeCount,t[1]=r.layers.length,t[2]=this.cellCount,t[3]=this.refinedCount;let i=0,a=0;return r.layers.forEach((e,o)=>{let s=(16+144*o)/4,c=e.weave;t[s]=e.nodeOffset,t[s+1]=e.nx,t[s+2]=e.ny,t[s+3]=e.bundle[0]|e.bundle[1]<<8|e.bundle[0]<<16|e.bundle[1]<<24,n[s+4]=c.pitchU,n[s+5]=c.pitchV,n[s+6]=1;let l=c.yarns[1],u=c.yarns[0];n.set([l.width,l.height,l.crimpAmplitude,.42],s+8),n.set([u.width,u.height,u.crimpAmplitude,-.38],s+12),t[s+16]=c.twillRepeat,t[s+17]=c.twillWarpOver,t[s+18]=2;let d=(e.nx-1)*2+1;t[s+20]=a,t[s+21]=d,t[s+22]=i,t[s+23]=c.id,n.set([this.edgeRows[o]??0,0,this.edgeSize[0],this.edgeSize[1]],s+24);let f=r.field[o];t.set([f.offset,f.K,f.M,0],s+28);let m=e=>Math.sqrt(e.linearDensity/(608*Math.PI));n.set([m(u),m(l),u.linearDensity/p,l.linearDensity/p],s+32),i+=(e.nx-1)*(e.ny-1),a+=d*((e.ny-1)*2+1)}),e}resetTopology(e){e.clearBuffer(this.edgeSig),e.clearBuffer(this.kappa)}resize(e,t){if(e===this.width&&t===this.height&&this.hdr)return;this.width=e,this.height=t,this.msaaColor?.destroy(),this.msaaDepth?.destroy(),this.hdr?.destroy();let n=[e,t];this.msaaColor=this.device.createTexture({label:`msaaColor`,size:n,format:Ce,sampleCount:4,usage:GPUTextureUsage.RENDER_ATTACHMENT}),this.msaaDepth=this.device.createTexture({label:`msaaDepth`,size:n,format:`depth32float`,sampleCount:4,usage:GPUTextureUsage.RENDER_ATTACHMENT}),this.hdr=this.device.createTexture({label:`hdr`,size:n,format:Ce,usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.TEXTURE_BINDING}),this.postGroup=this.device.createBindGroup({layout:this.postLayout,entries:[{binding:0,resource:{buffer:this.frameU}},{binding:1,resource:this.hdr.createView()}]})}lightMatrix(e){let t=D(w([e[0]+this.keyOffset[0],e[1]+this.keyOffset[1],e[2]+this.keyOffset[2]],e)),n=A([e[0]+t[0]*.9,e[1]+t[1]*.9,e[2]+t[2]*.9],e,Math.abs(t[2])>.95?[0,1,0]:[0,0,1]);return C(te(-.34,N,-.34,N,.3,1.2),n)}overMatrix(e){let t=D(this.overDir),n=A([e[0]+t[0],e[1]+t[1],e[2]+t[2]],e,Math.abs(t[2])>.95?[0,1,0]:[0,0,1]);return C(te(-.45,P,-.45,P,.7,1.3),n)}encode(e,t,n,r,i){let a=e=>i?{querySet:i,beginningOfPassWriteIndex:2*e,endOfPassWriteIndex:2*e+1}:void 0;if(!this.hdr||!this.msaaColor||!this.msaaDepth||!this.postGroup)return;let o=F(t,this.width/this.height),s=[t.target[0]+this.keyOffset[0],t.target[1]+this.keyOffset[1],t.target[2]+this.keyOffset[2]],c=D(w([t.target[0]+this.keyAim[0],t.target[1]+this.keyAim[1],t.target[2]+this.keyAim[2]],s)),l=/* @__PURE__ */ new Float32Array(128);l.set(o.viewProj,0),l.set(this.lightMatrix(t.target),16),l.set([...o.eye,t.fovY/this.height],32),l.set([...s,this.keyIntensity],36),l.set([...c,this.keyCone],40),l.set([...this.ambient,2*N/we],44),l.set([this.width,this.height,1/this.width,1/this.height],48);let u=Math.hypot(s[0]-t.target[0],s[1]-t.target[1],s[2]-t.target[2]);l.set([this.exposure,n,u,this.frameIndex++],52);let d=this.overMatrix(t.target),f=D(this.overDir);l.set(d,56),l.set([...f,2*P/Te],72),l.set([...this.overColor.map(e=>e*this.overIntensity),this.overAngle],76),l.set([this.floorZ,1/this.floorTile,+!!this.floorGroup,this.floorDetailTexels],80),l.set([.2490234375,.8999999999999999,2*N,we/4],84),l.set([this.overAngle,.6000000000000001,2*P,Te/4],88),this.device.queue.writeBuffer(this.frameU,0,l),l.set(d,16),l.set([t.target[0]+10*f[0],t.target[1]+10*f[1],t.target[2]+10*f[2]],36),this.device.queue.writeBuffer(this.frameOverU,0,l);let p=this.scene.nodeCount;e.clearBuffer(this.lists,0,16),e.clearBuffer(this.threadCount,8,4),e.clearBuffer(this.tailCount);let m=e.beginComputePass({label:`renderPrep`,timestampWrites:a(0)}),h=(e,t)=>{m.setPipeline(this.cpipes[e]),m.dispatchWorkgroups(t)},g=(e,t,n)=>{m.setPipeline(this.cpipes[e]),m.dispatchWorkgroupsIndirect(t,n)};m.setBindGroup(0,this.groups.threads),h(`retireCount`,Math.ceil(p/128)),m.setBindGroup(0,this.edgeArgsGroup),h(`edgeArgsMain`,1),m.setBindGroup(0,this.groups.threads);for(let e of[`threadClear`,`threadPresence`,`threadAnchor`,`threadCloth`,`threadScan`])g(e,this.edgeArgs,0);h(`threadArgs`,1),m.setBindGroup(0,this.groups.pieces),g(`piecesClear`,this.edgeArgs,16),g(`cellDirtyMain`,this.edgeArgs,32),g(`nodeAlloc`,this.edgeArgs,16),g(`piecesArgsMain`,this.edgeArgs,48),m.setBindGroup(0,this.groups.piecesSolve),g(`kappaSolve`,this.piecesArgs,0),m.setBindGroup(0,this.groups.pieces),h(`piecesArgsReset`,1),g(`edgeListMain`,this.edgeArgs,0),g(`edgeDrawArgs`,this.edgeArgs,48),this.edgeGroups.forEach((e,t)=>{m.setBindGroup(0,e),g(t===0?`seedInit`:t===this.edgeGroups.length-1?`edgeWrite`:`seedStep`,this.edgeArgs,0)}),m.setBindGroup(0,this.groups.refine),h(`nodeFrame`,Math.ceil(p/128)),h(`classifyCells`,Math.ceil(p/128)),h(`args`,1),h(`refine`,Math.ceil(this.refinedCount/128)),m.setBindGroup(0,this.groups.threadPrep),g(`threadPrep`,this.threadDraw,32),m.setBindGroup(0,this.groups.threadTail),g(`threadTail`,this.threadDraw,32),m.setBindGroup(0,this.groups.edgeRoots),g(`edgeRootsMain`,this.piecesArgs,32),m.end();let _=e.beginRenderPass({label:`shadow`,timestampWrites:a(1),colorAttachments:[],depthStencilAttachment:{view:this.shadowTex.createView(),depthClearValue:1,depthLoadOp:`clear`,depthStoreOp:`store`}});_.setBindGroup(0,this.groups.surfaceShadow),_.setPipeline(this.pipes.surfaceShadow),_.draw(24,this.cellCount),_.setPipeline(this.pipes.fineShadow),_.drawIndirect(this.drawArgs,64),_.setBindGroup(0,this.groups.threadShadow),_.setPipeline(this.pipes.threadShadow),_.drawIndirect(this.threadDraw,0),_.setBindGroup(0,this.groups.mountShadow),_.setPipeline(this.pipes.mountShadow),_.draw(24),_.end();let v=e.beginRenderPass({label:`overShadow`,colorAttachments:[],depthStencilAttachment:{view:this.overTex.createView(),depthClearValue:1,depthLoadOp:`clear`,depthStoreOp:`store`}});if(v.setBindGroup(0,this.groups.surfaceOver),v.setPipeline(this.pipes.surfaceShadow),v.draw(24,this.cellCount),v.setPipeline(this.pipes.fineShadow),v.drawIndirect(this.drawArgs,64),v.setBindGroup(0,this.groups.threadOver),v.setPipeline(this.pipes.threadShadow),v.drawIndirect(this.threadDraw,0),v.setBindGroup(0,this.groups.mountOver),v.setPipeline(this.pipes.mountShadow),v.draw(24),v.end(),this.floorGroup){let t=e.beginComputePass({label:`floorCoverage`});for(let e of this.covGroups)t.setPipeline(e.pipe),t.setBindGroup(0,e.group),t.dispatchWorkgroups(Math.ceil(e.size/8),Math.ceil(e.size/8));t.end()}let y=e.beginRenderPass({label:`main`,timestampWrites:a(2),colorAttachments:[{view:this.msaaColor.createView(),resolveTarget:this.hdr.createView(),clearValue:{r:this.background[0],g:this.background[1],b:this.background[2],a:1},loadOp:`clear`,storeOp:`discard`}],depthStencilAttachment:{view:this.msaaDepth.createView(),depthClearValue:1,depthLoadOp:`clear`,depthStoreOp:`discard`}});y.setBindGroup(0,this.groups.surface),y.setPipeline(this.pipes.surface),y.draw(24,this.cellCount),y.setPipeline(this.pipes.fine),y.drawIndirect(this.drawArgs,64),y.setBindGroup(0,this.groups.thread),y.setPipeline(this.pipes.thread),y.drawIndirect(this.threadDraw,0),y.setBindGroup(0,this.groups.mount),y.setPipeline(this.pipes.mount),y.draw(24),this.floorGroup&&(y.setBindGroup(0,this.floorGroup),y.setPipeline(this.pipes.floor),y.draw(6)),y.setBindGroup(0,this.groups.thread),y.setPipeline(this.pipes.threadFuzz),y.drawIndirect(this.threadDraw,16),y.setBindGroup(0,this.groups.fuzz),y.setPipeline(this.pipes.edgeFuzz),y.drawIndirect(this.piecesArgs,16),y.end();let b=e.beginRenderPass({label:`post`,timestampWrites:a(3),colorAttachments:[{view:r,loadOp:`clear`,storeOp:`store`,clearValue:{r:0,g:0,b:0,a:1}}]});b.setPipeline(this.pipes.post),b.setBindGroup(0,this.postGroup),b.draw(3),b.end()}};const L={radius:.008,maxForce:120,maxLead:.006,pinch:.3,pinchMode:`pads`,pinchAxis:0,engageTime:.15};function R(e){let t=Math.min(1,Math.max(0,e/L.engageTime));return 1-(1-L.pinch)*t*t*(3-2*t)}function z(e){let t=Math.min(...e.layers.map(e=>Math.min(e.material.pitchU,e.material.pitchV)));return Math.ceil(L.radius/t)}function Ne(e,t,n=()=>!0,r){let i=Fe(e,t,n,r);if(!i||L.pinchMode===`radial`)return i;for(let n of[L.pinchAxis,1-L.pinchAxis]){let r=Pe(e,t,i,n);if(r)return r}return i}function Pe(e,t,n,r){let i=e.layers.find(e=>t>=e.nodeOffset&&t<e.nodeOffset+e.nodeCount),a=r===0?i.material.pitchU:i.material.pitchV,o=e.restUV[2*t+r],s={nodes:[],weights:[],sides:[],stiffness:0,padPitch:a,between:[]},c=[0,0];return n.nodes.forEach((t,i)=>{let l=e.restUV[2*t+r]-o;if(Math.abs(l)<.5*a){s.between.push(t);return}s.nodes.push(t),s.weights.push(n.weights[i]),s.sides.push(Math.sign(l)),c[+(l>0)]+=n.weights[i]}),Math.min(c[0],c[1])<.25*Math.max(c[0],c[1])||c[0]===0?null:(s.stiffness=L.maxForce/(L.maxLead*(c[0]+c[1])),s)}function Fe(e,t,n,r){let i=e.layers.find(e=>t>=e.nodeOffset&&t<e.nodeOffset+e.nodeCount);if(!i)return null;let a=e.restUV[2*t],o=e.restUV[2*t+1],s=L.radius,c=i.material,l=r?Ie(r,c.pitchU,c.pitchV,1.5*s):null,u=r?r.radius:Math.ceil(s/c.pitchU),d=r?r.radius:Math.ceil(s/c.pitchV),f=2*u+1,p=t-i.nodeOffset,m=p%i.nx,h=Math.floor(p/i.nx),g=[],_=[],v=0;for(let t=Math.max(0,h-d);t<=Math.min(i.ny-1,h+d);t++)for(let r=Math.max(0,m-u);r<=Math.min(i.nx-1,m+u);r++){let c=i.nodeOffset+t*i.nx+r;if(e.pinned[c]||!n(c)||l&&!l[(t-h+d)*f+(r-m+u)])continue;let p=Math.hypot(e.restUV[2*c]-a,e.restUV[2*c+1]-o)/s;if(p>=1)continue;let y=p<.5?1:1-(p-.5)/.5,b=y*y*(3-2*y);b<=.001||(g.push(c),_.push(b),v+=b)}return g.length===0?null:{nodes:g,weights:_,sides:g.map(()=>0),padPitch:0,between:[],stiffness:L.maxForce/(L.maxLead*v)}}function Ie(e,t,n,r){let i=2*e.radius+1,a=i*i,o=new Float64Array(a).fill(1/0),s=new Uint8Array(a),c=t=>!!(e.bits[t]&12),l=e.radius*i+e.radius;if(c(l))return s;for(o[l]=0;;){let l=-1;for(let e=0;e<a;e++)!s[e]&&o[e]<=r&&(l<0||o[e]<o[l])&&(l=e);if(l<0)return s;s[l]=1;let u=l%i,d=(l-u)/i,f=(e,t)=>{!c(e)&&!s[e]&&(o[e]=Math.min(o[e],o[l]+t))};u+1<i&&e.bits[l]&1&&f(l+1,t),u>0&&e.bits[l-1]&1&&f(l-1,t),d+1<i&&e.bits[l]&2&&f(l+i,n),d>0&&e.bits[l-i]&2&&f(l-i,n)}}var B=`// Picking and grip terms. A grip is a finite material patch attached to a handle by quadratic
 // springs (exact for Newton). Its force is bounded by clamping the handle's lead over the patch
 // centroid once per substep (gripLead); gradient and stiffness enter the Newton system via ext.
 // Up to GRIPS grips (one per finger) hold disjoint patches: entries of grip g occupy
@@ -4921,13 +5118,22 @@ fn fsMount(in: VOut) -> @location(0) vec4<f32> {
 const GRIP_ADDS: bool = true;
 const GRIPS: u32 = 4u;
 const SLOT_ENTRIES: u32 = 512u;
+// proximity-pick candidates (cursor disc) tested for occlusion
+const MAX_CAND: u32 = 128u;
+const NONE: u32 = 0xFFFFFFFFu;
+// a candidate counts as hidden only behind a surface at least this far in front of it (m)
+const OCCLUDE_MARGIN: f32 = 0.5e-3;
 
 struct GripSlot {
-  // handle target (xyz), entry count (w as f32)
+  // requested handle (xyz, in the frame of \`anchor\`), entry count (w as f32)
   goal: vec4<f32>,
   // stiffness per unit weight (N/m), largest handle lead (m), picked node (bitcast), pinch scale of the
   // grab-time offsets (grip.ts pinchScale)
   params: vec4<f32>,
+  // where the host believed the picked material was when it attached (xyz): the handle is
+  // origin + goal - anchor, so a stationary pointer imposes no displacement whatever the pick latency;
+  // lattice pitch along the pads' closing axis (w; grip.ts GripPatch.padPitch)
+  anchor: vec4<f32>,
 };
 
 struct GripU {
@@ -4936,16 +5142,20 @@ struct GripU {
 
 struct PickU {
   viewProj: mat4x4<f32>,
-  // pointer x, y (drawing-buffer pixels), radius (pixels), unused
+  // pointer x, y (drawing-buffer pixels), proximity radius (pixels), unused
   pointer: vec4<f32>,
-  // width, height, layer depth tolerance (NDC depth), unused
+  // width, height, strand pick radius (m), patch window radius (lattice cells, as f32)
   viewport: vec4<f32>,
+  // ray origin (camera eye) and unit direction through the pointer (world)
+  eye: vec4<f32>,
+  ray: vec4<f32>,
 };
 
 struct GripEntry {
   node: u32,
   w: f32,
-  pad0: f32,
+  // pad along the closing axis (-1, +1), 0 in a radial pinch
+  side: f32,
   pad1: f32,
   offset: vec4<f32>,
 };
@@ -4959,14 +5169,30 @@ struct GripEntry {
 @group(0) @binding(6) var<storage, read> segs: array<Seg>;
 @group(0) @binding(7) var<storage, read_write> grip: array<GripEntry>;
 @group(0) @binding(8) var<storage, read_write> ext: array<vec4<f32>>; // 3 per node (see assemble.wgsl)
-@group(0) @binding(9) var<storage, read_write> pick: array<atomic<u32>>; // [depthKey, distKey]
-@group(0) @binding(10) var<storage, read_write> pickOut: array<vec4<f32>>;
-// [g] effective handle of grip g (xyz)
+// [0] nearest ray hit (f32 bits of t), [1] its material node, [2] candidate count, [3] nearest visible
+// candidate (screen distance << 20 | node), [4, 4 + MAX_CAND) candidates, then their occluded flags
+@group(0) @binding(9) var<storage, read_write> pick: array<atomic<u32>>;
+// [0..2] picked point (f32 bits), [3] node, [4] kind (0 none, 1 surface hit, 2 proximity),
+// [8, 8 + 256) patch window around the node (pickWindow)
+@group(0) @binding(10) var<storage, read_write> pickOut: array<u32>;
+// [3g] effective handle of grip g (xyz), [3g + 1] its origin: the picked node's position at grab time,
+// [3g + 2] the pads' closing axis (unit, world; from the grab-time offsets)
 @group(0) @binding(11) var<storage, read_write> gripGoal: array<vec4<f32>>;
 // x: the grip whose entries gripInit initialises
 @group(0) @binding(12) var<uniform> InitU: vec4<u32>;
 
 var<workgroup> leadSum: array<vec4<f32>, 256>;
+
+// a node of the cloth solve (debris and retired nodes no longer respond to the grip)
+fn live(n: u32) -> bool { return x[n].w < 0.5; }
+
+// Target offset of a patch entry from the handle at pinch scale s: a radial pinch contracts it toward
+// the grab point; a pad slides rigidly toward the grab line along the closing axis by (1 - s) pitches.
+fn gathered(e: GripEntry, S: GripSlot, axis: vec3<f32>) -> vec3<f32> {
+  let s = S.params.w;
+  if (e.side == 0.0) { return s * e.offset.xyz; }
+  return e.offset.xyz - e.side * (1.0 - s) * S.anchor.w * axis;
+}
 
 // Once per substep, from committed positions: each grip's effective handle is the requested one,
 // moved to within the largest lead of its weighted patch centroid (bounded total force). One
@@ -4977,10 +5203,29 @@ fn gripLead(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: 
   let S = G.slots[g];
   let count = u32(S.goal.w);
   if (count == 0u) { return; }
+  // the closing axis: from the - pad to the + pad, as they lay at grab time
+  var dir = vec4<f32>(0.0);
+  for (var k = t; k < count; k += 256u) {
+    let e = grip[g * SLOT_ENTRIES + k];
+    dir += vec4<f32>(e.side * e.w * e.offset.xyz, 0.0);
+  }
+  leadSum[t] = dir;
+  workgroupBarrier();
+  var r = 128u;
+  loop {
+    if (r == 0u) { break; }
+    if (t < r) { leadSum[t] += leadSum[t + r]; }
+    workgroupBarrier();
+    r = r / 2u;
+  }
+  let ld = length(leadSum[0].xyz);
+  let axis = select(vec3<f32>(0.0), leadSum[0].xyz / max(ld, 1e-20), ld > 1e-12);
+  workgroupBarrier();
   var acc = vec4<f32>(0.0);
   for (var k = t; k < count; k += 256u) {
     let e = grip[g * SLOT_ENTRIES + k];
-    acc += vec4<f32>(e.w * (x[e.node].xyz - S.params.w * e.offset.xyz), e.w);
+    if (!live(e.node)) { continue; }
+    acc += vec4<f32>(e.w * (x[e.node].xyz - gathered(e, S, axis)), e.w);
   }
   leadSum[t] = acc;
   workgroupBarrier();
@@ -4992,11 +5237,18 @@ fn gripLead(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: 
     s = s / 2u;
   }
   if (t == 0u) {
-    let c = leadSum[0].xyz / max(leadSum[0].w, 1e-12);
-    var lead = S.goal.xyz - c;
+    gripGoal[3u * g + 2u] = vec4<f32>(axis, 0.0);
+    if (leadSum[0].w <= 0.0) {
+      // nothing held is still cloth: the handle exerts nothing
+      gripGoal[3u * g] = vec4<f32>(gripGoal[3u * g + 1u].xyz, 0.0);
+      return;
+    }
+    let c = leadSum[0].xyz / leadSum[0].w;
+    let requested = gripGoal[3u * g + 1u].xyz + S.goal.xyz - S.anchor.xyz;
+    var lead = requested - c;
     let l = length(lead);
     if (l > S.params.y) { lead *= S.params.y / l; }
-    gripGoal[g] = vec4<f32>(c + lead, 0.0);
+    gripGoal[3u * g] = vec4<f32>(c + lead, 0.0);
   }
 }
 
@@ -5008,8 +5260,9 @@ fn gripTerms(@builtin(global_invocation_id) gid: vec3<u32>) {
   let S = G.slots[g];
   if (k >= u32(S.goal.w)) { return; }
   let e = grip[gid.x];
+  if (!live(e.node)) { return; }
   let y = x[e.node].xyz + dx[e.node].xyz;
-  let d = y - (gripGoal[g].xyz + S.params.w * e.offset.xyz);
+  let d = y - (gripGoal[3u * g].xyz + gathered(e, S, gripGoal[3u * g + 2u].xyz));
   let kg = S.params.x * e.w;
   let force = kg * d;
   let stiff = kg;
@@ -5021,66 +5274,269 @@ fn gripTerms(@builtin(global_invocation_id) gid: vec3<u32>) {
   ext[b + 2u] = keep * ext[b + 2u] + vec4<f32>(0.0, stiff, 0.0, 0.0);
 }
 
-// Offsets of a grip's patch nodes from its picked node at grab time.
+// Offsets of a grip's patch nodes from its picked node at grab time, and the grip's origin (the picked
+// node's position now, in the same state the offsets are taken from).
 @compute @workgroup_size(64)
 fn gripInit(@builtin(global_invocation_id) gid: vec3<u32>) {
   let g = InitU.x;
   let S = G.slots[g];
+  let picked = bitcast<u32>(S.params.z);
+  if (gid.x == 0u) {
+    gripGoal[3u * g + 1u] = vec4<f32>(x[picked].xyz, 0.0);
+    gripGoal[3u * g] = vec4<f32>(x[picked].xyz, 0.0);
+  }
   if (gid.x >= u32(S.goal.w)) { return; }
   let k = g * SLOT_ENTRIES + gid.x;
-  let picked = bitcast<u32>(S.params.z);
   grip[k].offset = vec4<f32>(x[grip[k].node].xyz - x[picked].xyz, 0.0);
 }
 
+// ---------------------------------------------------------------- picking (on demand, at a grab)
+
+fn lat(n: u32) -> vec4<u32> { return P.layers[nodes[n].ijl >> 24u].lattice; }
+fn col(n: u32) -> u32 { return nodes[n].ijl & 0xFFFu; }
+fn row(n: u32) -> u32 { return (nodes[n].ijl >> 12u) & 0xFFFu; }
+fn spanOn(owner: u32, f: u32) -> bool { return segActive(segs[2u * owner + f]); }
+
+// A cloth crossing with at least one surviving incident span, owned or incoming (debris and isolated
+// crossings are not grab targets).
 fn hasMaterial(n: u32) -> bool {
-  // a cloth crossing with at least one intact span (debris and isolated fragments are not grab targets)
-  if (x[n].w > 0.5) { return false; }
-  let a = segs[2u * n].flags;
-  let b = segs[2u * n + 1u].flags;
-  return ((a & 3u) == 1u) || ((b & 3u) == 1u);
+  if (!live(n)) { return false; }
+  if (spanOn(n, 0u) || spanOn(n, 1u)) { return true; }
+  let L = lat(n);
+  if (col(n) > 0u && spanOn(n - 1u, 0u)) { return true; }
+  return row(n) > 0u && spanOn(n - L.y, 1u);
 }
 
-fn project(n: u32) -> vec3<f32> {
-  let c = PK.viewProj * vec4<f32>(x[n].xyz, 1.0);
+// An intact cell with lower-left node f (all four spans hold, all corners cloth): a surface face.
+fn faceValid(f: u32) -> bool {
+  let L = lat(f);
+  if (col(f) + 1u >= L.y || row(f) + 1u >= L.z) { return false; }
+  let c10 = f + 1u;
+  let c01 = f + L.y;
+  if (!live(f) || !live(c10) || !live(c01) || !live(c01 + 1u)) { return false; }
+  return spanOn(f, 0u) && spanOn(f, 1u) && spanOn(c10, 1u) && spanOn(c01, 0u);
+}
+
+// Ray (o, d) against triangle (a, b, c): (t, u, v) with barycentric weights (1 - u - v, u, v); t < 0
+// when missed.
+fn rayTri(o: vec3<f32>, d: vec3<f32>, a: vec3<f32>, b: vec3<f32>, c: vec3<f32>) -> vec3<f32> {
+  let e1 = b - a;
+  let e2 = c - a;
+  let p = cross(d, e2);
+  let det = dot(e1, p);
+  if (abs(det) < 1e-14) { return vec3<f32>(-1.0, 0.0, 0.0); }
+  let inv = 1.0 / det;
+  let s = o - a;
+  let u = dot(s, p) * inv;
+  if (u < 0.0 || u > 1.0) { return vec3<f32>(-1.0, 0.0, 0.0); }
+  let q = cross(s, e1);
+  let v = dot(d, q) * inv;
+  if (v < 0.0 || u + v > 1.0) { return vec3<f32>(-1.0, 0.0, 0.0); }
+  return vec3<f32>(dot(e2, q) * inv, u, v);
+}
+
+// Ray (o, unit d) against the capsule of radius r around segment (a, b): (t, s) with s the segment
+// parameter of the closest approach; t < 0 when missed.
+fn rayCapsule(o: vec3<f32>, d: vec3<f32>, a: vec3<f32>, b: vec3<f32>, r: f32) -> vec2<f32> {
+  let e = b - a;
+  let w = o - a;
+  let ee = dot(e, e);
+  let de = dot(d, e);
+  let den = ee - de * de;
+  var s = 0.0;
+  if (den > 1e-14) { s = clamp((dot(e, w) * dot(d, d) - de * dot(d, w)) / den, 0.0, 1.0); }
+  let q = a + s * e;
+  let t = max(dot(q - o, d), 0.0);
+  let gap = length(o + t * d - q);
+  if (gap > r) { return vec2<f32>(-1.0, 0.0); }
+  return vec2<f32>(t - sqrt(r * r - gap * gap), s);
+}
+
+struct RayHit {
+  t: f32,
+  node: u32,
+};
+
+// Nearest pointer-ray hit among the material primitives node n owns: the intact face it is the
+// lower-left corner of (two triangles), and its surviving spans not covered by an intact face on
+// either side (strands over openings, as capsules of the strand pick radius). The material node is the
+// hit's nearest corner (face) or nearer end (strand).
+fn rayPrims(n: u32) -> RayHit {
+  var best = RayHit(3.4e38, NONE);
+  let o = PK.eye.xyz;
+  let d = PK.ray.xyz;
+  let L = lat(n);
+  if (faceValid(n)) {
+    let c = vec4<u32>(n, n + 1u, n + L.y, n + L.y + 1u);
+    let p00 = x[c.x].xyz;
+    let p10 = x[c.y].xyz;
+    let p01 = x[c.z].xyz;
+    let p11 = x[c.w].xyz;
+    let h1 = rayTri(o, d, p00, p10, p11);
+    if (h1.x > 0.0 && h1.x < best.t) {
+      let w = vec3<f32>(1.0 - h1.y - h1.z, h1.y, h1.z);
+      best = RayHit(h1.x, select(select(c.w, c.y, w.y >= w.z), c.x, w.x >= max(w.y, w.z)));
+    }
+    let h2 = rayTri(o, d, p00, p11, p01);
+    if (h2.x > 0.0 && h2.x < best.t) {
+      let w = vec3<f32>(1.0 - h2.y - h2.z, h2.y, h2.z);
+      best = RayHit(h2.x, select(select(c.z, c.w, w.y >= w.z), c.x, w.x >= max(w.y, w.z)));
+    }
+  }
+  if (!live(n)) { return best; }
+  for (var f = 0u; f < 2u; f++) {
+    if (!spanOn(n, f)) { continue; }
+    let other = select(n + L.y, n + 1u, f == 0u);
+    if (!live(other)) { continue; }
+    // the two cells beside the span
+    let side = select(n - 1u, n - L.y, f == 0u);
+    let hasSide = select(col(n) > 0u, row(n) > 0u, f == 0u);
+    if (faceValid(n) || (hasSide && faceValid(side))) { continue; }
+    let h = rayCapsule(o, d, x[n].xyz, x[other].xyz, PK.viewport.z);
+    if (h.x > 0.0 && h.x < best.t) { best = RayHit(h.x, select(n, other, h.y > 0.5)); }
+  }
+  return best;
+}
+
+fn project(p: vec3<f32>) -> vec4<f32> {
+  let c = PK.viewProj * vec4<f32>(p, 1.0);
   let ndc = c.xyz / c.w;
-  return vec3<f32>((ndc.x * 0.5 + 0.5) * PK.viewport.x, (0.5 - ndc.y * 0.5) * PK.viewport.y, ndc.z);
+  return vec4<f32>((ndc.x * 0.5 + 0.5) * PK.viewport.x, (0.5 - ndc.y * 0.5) * PK.viewport.y, ndc.z, c.w);
 }
 
+// Pass 1: nearest surface hit along the pointer ray.
 @compute @workgroup_size(128)
-fn pickDepth(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn pickRay(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = gid.x;
-  if (n >= P.counts.x || !hasMaterial(n)) { return; }
-  let p = project(n);
-  if (p.z <= 0.0 || p.z >= 1.0) { return; }
+  if (n >= P.counts.x) { return; }
+  let h = rayPrims(n);
+  if (h.node != NONE) { atomicMin(&pick[0], bitcast<u32>(h.t)); }
+}
+
+// Pass 2: the material node of that hit (the lowest index on an exact tie).
+@compute @workgroup_size(128)
+fn pickRayNode(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let n = gid.x;
+  if (n >= P.counts.x) { return; }
+  let front = atomicLoad(&pick[0]);
+  if (front == NONE) { return; }
+  let h = rayPrims(n);
+  if (h.node != NONE && bitcast<u32>(h.t) == front) { atomicMin(&pick[1], h.node); }
+}
+
+// Pass 3 (the pointer is over no surface: an opening, a strand, an edge): crossings within the cursor
+// disc are candidates.
+@compute @workgroup_size(128)
+fn pickCandidates(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let n = gid.x;
+  if (n >= P.counts.x || atomicLoad(&pick[0]) != NONE || !hasMaterial(n)) { return; }
+  let p = project(x[n].xyz);
+  if (p.w <= 0.0 || p.z <= 0.0 || p.z >= 1.0) { return; }
   if (distance(p.xy, PK.pointer.xy) > PK.pointer.z) { return; }
-  atomicMin(&pick[0], u32(p.z * 16777215.0));
+  let k = atomicAdd(&pick[2], 1u);
+  if (k < MAX_CAND) { atomicStore(&pick[4u + k], n); }
 }
 
+// Pass 4: a candidate is hidden when an intact face lies on the line of sight in front of it. One
+// thread per face; faces whose screen footprint misses the cursor disc are skipped at once.
 @compute @workgroup_size(128)
-fn pickNearest(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let n = gid.x;
-  if (n >= P.counts.x || !hasMaterial(n)) { return; }
-  let p = project(n);
-  if (p.z <= 0.0 || p.z >= 1.0) { return; }
-  let d = distance(p.xy, PK.pointer.xy);
-  if (d > PK.pointer.z) { return; }
-  let front = f32(atomicLoad(&pick[0])) / 16777215.0;
-  if (p.z > front + PK.viewport.z) { return; }
+fn pickOcclude(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let f = gid.x;
+  if (f >= P.counts.x) { return; }
+  let count = min(atomicLoad(&pick[2]), MAX_CAND);
+  if (count == 0u || !faceValid(f)) { return; }
+  let L = lat(f);
+  let c = vec4<u32>(f, f + 1u, f + L.y, f + L.y + 1u);
+  let p00 = x[c.x].xyz;
+  let p10 = x[c.y].xyz;
+  let p01 = x[c.z].xyz;
+  let p11 = x[c.w].xyz;
+  let s0 = project(p00);
+  let s1 = project(p10);
+  let s2 = project(p01);
+  let s3 = project(p11);
+  if (min(min(s0.w, s1.w), min(s2.w, s3.w)) <= 0.0) { return; }
+  let lo = min(min(s0.xy, s1.xy), min(s2.xy, s3.xy)) - PK.pointer.z;
+  let hi = max(max(s0.xy, s1.xy), max(s2.xy, s3.xy)) + PK.pointer.z;
+  if (any(PK.pointer.xy < lo) || any(PK.pointer.xy > hi)) { return; }
+  let o = PK.eye.xyz;
+  for (var k = 0u; k < count; k++) {
+    let m = atomicLoad(&pick[4u + k]);
+    if (any(c == vec4<u32>(m))) { continue; }
+    let to = x[m].xyz - o;
+    let len = length(to);
+    let d = to / len;
+    let tmax = len - OCCLUDE_MARGIN;
+    let h1 = rayTri(o, d, p00, p10, p11);
+    let h2 = rayTri(o, d, p00, p11, p01);
+    if ((h1.x > 0.0 && h1.x < tmax) || (h2.x > 0.0 && h2.x < tmax)) { atomicOr(&pick[4u + MAX_CAND + k], 1u); }
+  }
+}
+
+// Pass 5: the visible candidate nearest to the pointer on screen.
+@compute @workgroup_size(128)
+fn pickVisible(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let k = gid.x;
+  if (k >= min(atomicLoad(&pick[2]), MAX_CAND) || atomicLoad(&pick[4u + MAX_CAND + k]) != 0u) { return; }
+  let n = atomicLoad(&pick[4u + k]);
+  let d = distance(project(x[n].xyz).xy, PK.pointer.xy);
   let dk = min(4095u, u32(d * 64.0));
-  atomicMin(&pick[1], (dk << 20u) | (n & 0xFFFFFu));
+  atomicMin(&pick[3], (dk << 20u) | (n & 0xFFFFFu));
 }
 
 @compute @workgroup_size(1)
 fn pickWrite() {
-  let key = atomicLoad(&pick[1]);
-  if (key == 0xFFFFFFFFu) {
-    pickOut[0] = vec4<f32>(-1.0);
+  let front = atomicLoad(&pick[0]);
+  var p = vec3<f32>(0.0);
+  var n = NONE;
+  var kind = 0u;
+  if (front != NONE) {
+    n = atomicLoad(&pick[1]);
+    p = PK.eye.xyz + bitcast<f32>(front) * PK.ray.xyz;
+    kind = 1u;
+  } else {
+    let key = atomicLoad(&pick[3]);
+    if (key != NONE) {
+      n = key & 0xFFFFFu;
+      p = x[n].xyz;
+      kind = 2u;
+    }
+  }
+  pickOut[0] = bitcast<u32>(p.x);
+  pickOut[1] = bitcast<u32>(p.y);
+  pickOut[2] = bitcast<u32>(p.z);
+  pickOut[3] = n;
+  pickOut[4] = kind;
+}
+
+// The current connectivity around the picked node (grip.ts gripPatch grows the patch through it): per
+// lattice offset (di, dj) in [-R, R]^2, bit0 / bit1 = its own span along u / v survives, bit2 = not
+// cloth, bit3 = outside the lattice.
+@compute @workgroup_size(256)
+fn pickWindow(@builtin(local_invocation_index) k: u32) {
+  let n = pickOut[3];
+  let R = u32(PK.viewport.w);
+  let side = 2u * R + 1u;
+  if (k >= side * side) { return; }
+  if (pickOut[4] == 0u) {
+    pickOut[8u + k] = 8u;
     return;
   }
-  let n = key & 0xFFFFFu;
-  pickOut[0] = vec4<f32>(x[n].xyz, bitcast<f32>(n));
+  let L = lat(n);
+  let i = i32(col(n)) + i32(k % side) - i32(R);
+  let j = i32(row(n)) + i32(k / side) - i32(R);
+  if (i < 0 || j < 0 || i >= i32(L.y) || j >= i32(L.z)) {
+    pickOut[8u + k] = 8u;
+    return;
+  }
+  let m = L.x + u32(j) * L.y + u32(i);
+  var b = 0u;
+  if (spanOn(m, 0u)) { b |= 1u; }
+  if (spanOn(m, 1u)) { b |= 2u; }
+  if (!live(m)) { b |= 4u; }
+  pickOut[8u + k] = b;
 }
-`,Fe=class{device;solver;scene;mod;gripU;initU;pickU;grip;pick;pickOut;gripGoal;group;pipes={};staging=[];held=[,,,,].fill(null);owner=/* @__PURE__ */ new Map;constructor(e,t,n){this.device=e,this.solver=t,this.scene=n;let r=Pe.replace(`const GRIP_ADDS: bool = true;`,`const GRIP_ADDS: bool = ${t.contactEnabled};`);this.mod=new f(e,`interact`,_+r);for(let e of[`gripTerms`,`gripLead`,`gripInit`,`pickDepth`,`pickNearest`,`pickWrite`])this.pipes[e]=this.mod.pipeline(e);this.gripGoal=a(e,`gripGoal`,64),this.gripU=a(e,`gripU`,128,i),this.initU=a(e,`gripInitU`,16,i),this.pickU=a(e,`pickU`,96,i),this.grip=a(e,`grip`,65536),this.pick=a(e,`pick`,16),this.pickOut=a(e,`pickOut`,16),this.group=this.mod.bindGroup(`interact`,{0:t.simParams,1:this.gripU,2:this.pickU,3:t.nodes,4:t.x,5:t.dx,6:t.segs,7:this.grip,8:t.ext,9:this.pick,10:this.pickOut,11:this.gripGoal,12:this.initU})}run(e,t,n){e.setPipeline(this.pipes[t]),e.setBindGroup(0,this.group),e.dispatchWorkgroups(n)}async pickAt(e,t,n,r,i,a){let o=/* @__PURE__ */ new Float32Array(24);o.set(e,0),o.set([t,n,a,0],16),o.set([r,i,4e-4,0],20),this.device.queue.writeBuffer(this.pickU,0,o),this.device.queue.writeBuffer(this.pick,0,new Uint32Array([4294967295,4294967295,0,0]));let s=this.device.createCommandEncoder({label:`pick`}),c=s.beginComputePass(),l=Math.ceil(this.solver.N/128);this.run(c,`pickDepth`,l),this.run(c,`pickNearest`,l),this.run(c,`pickWrite`,1),c.end();let u=this.staging.pop()??this.device.createBuffer({size:16,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});s.copyBufferToBuffer(this.pickOut,0,u,0,16),this.device.queue.submit([s.finish()]),await u.mapAsync(GPUMapMode.READ);let d=new Float32Array(u.getMappedRange().slice(0));return u.unmap(),this.staging.push(u),d[0]===-1&&d[1]===-1?null:{node:new Uint32Array(d.buffer)[3],position:[d[0],d[1],d[2]]}}freeSlot(){return this.held.indexOf(null)}holder(e){return this.owner.get(e)??-1}attach(e,t,n=0){this.release(n);let r=R(this.scene,e,e=>!this.owner.has(e));if(!r)return!1;let i=Math.min(r.nodes.length,512),a=/* @__PURE__ */ new ArrayBuffer(32*i),o=new Uint32Array(a),s=new Float32Array(a),c=[],l=[];for(let e=0;e<i;e++)o[8*e]=r.nodes[e],s[8*e+1]=r.weights[e],c.push(r.nodes[e]),r.weights[e]>=.5&&l.push(r.nodes[e]),this.owner.set(r.nodes[e],n);this.held[n]={nodes:c,core:l},this.device.queue.writeBuffer(this.grip,16384*n,a);let u=/* @__PURE__ */ new Float32Array(8);u.set([t[0],t[1],t[2],i],0),u.set([r.stiffness,L.maxLead,0,1],4),new Uint32Array(u.buffer)[6]=e,this.device.queue.writeBuffer(this.gripU,32*n,u),this.device.queue.writeBuffer(this.initU,0,new Uint32Array([n,0,0,0]));let d=this.device.createCommandEncoder({label:`gripInit`}),f=d.beginComputePass();return this.run(f,`gripInit`,Math.ceil(i/64)),f.end(),this.device.queue.submit([d.finish()]),!0}setPinch(e,t=0){this.held[t]&&this.device.queue.writeBuffer(this.gripU,32*t+28,new Float32Array([e]))}setTarget(e,t=0){let n=this.held[t];n&&this.device.queue.writeBuffer(this.gripU,32*t,new Float32Array([e[0],e[1],e[2],n.nodes.length]))}release(e=0){let t=this.held[e];if(t){for(let e of t.nodes)this.owner.delete(e);if(this.held[e]=null,this.device.queue.writeBuffer(this.gripU,32*e+12,new Float32Array([0])),!this.solver.contactEnabled){let e=this.device.createCommandEncoder({label:`gripRelease`});e.clearBuffer(this.solver.ext),this.device.queue.submit([e.finish()])}}}releaseAll(){for(let e=0;e<4;e++)this.release(e)}get active(){return this.held.some(e=>e!==null)}get patchNodes(){return this.held.flatMap(e=>e?.nodes??[])}get coreNodes(){return this.held.flatMap(e=>e?.core??[])}core(e){return this.held[e]?.core??[]}encodeSubstep(e){this.active&&this.run(e,`gripLead`,4)}encode(e){this.active&&e(this.pipes.gripTerms,this.group,32)}};function z(e){return Math.ceil((e-1)/2)+1}function Ie(e){let t=0;return e.map(e=>{let n={nx:z(e.nx),ny:z(e.ny),offset:t};return t+=n.nx*n.ny,n})}function B(e,t=48){return e.every(e=>e.nx*e.ny>t&&e.nx>=5&&e.ny>=5)}function Le(e,t=48){let n=[e];for(;;){let e=n[n.length-1];if(V(e)<=t||!B(e))break;n.push(Ie(e))}return n}function V(e){return e.reduce((e,t)=>e+t.nx*t.ny,0)}function H(e,t=3){let n=Array.from({length:2*t},()=>[]),r=0;for(let i of e){for(let e=0;e<i.nx;e++)n[e%t].push([i.offset+e,i.nx,i.ny,1]),r=Math.max(r,i.ny);for(let e=0;e<i.ny;e++)n[t+e%t].push([i.offset+e*i.nx,1,i.nx,0]),r=Math.max(r,i.nx)}let i=[0],a=[];for(let e of n){for(let t of e)a.push(...t);i.push(i[i.length-1]+e.length)}return{lines:new Uint32Array(a),colorStart:i,maxLength:r}}var Re=`// Cross-layer contact between crossing nodes. The contact distance (midsurface separation of two plies,
+`,Le=class{device;solver;scene;mod;gripU;initU;pickU;grip;pick;pickOut;gripGoal;group;pipes={};staging=[];held=[,,,,].fill(null);owner=/* @__PURE__ */ new Map;windowRadius;strandRadius;constructor(e,t,n){this.device=e,this.solver=t,this.scene=n;let r=B.replace(`const GRIP_ADDS: bool = true;`,`const GRIP_ADDS: bool = ${t.contactEnabled};`);this.mod=new f(e,`interact`,_+r);for(let e of[`gripTerms`,`gripLead`,`gripInit`,`pickRay`,`pickRayNode`,`pickCandidates`,`pickOcclude`,`pickVisible`,`pickWrite`,`pickWindow`])this.pipes[e]=this.mod.pipeline(e);if(this.gripGoal=a(e,`gripGoal`,192),this.gripU=a(e,`gripU`,192,i),this.initU=a(e,`gripInitU`,16,i),this.pickU=a(e,`pickU`,128,i),this.grip=a(e,`grip`,65536),this.pick=a(e,`pick`,1040),this.pickOut=a(e,`pickOut`,1056),this.windowRadius=z(n),this.windowRadius>7)throw Error(`a grip patch spans ${this.windowRadius} lattice cells; the pick window covers 7`);this.strandRadius=.25*Math.min(...n.layers.map(e=>Math.min(e.material.pitchU,e.material.pitchV))),this.group=this.mod.bindGroup(`interact`,{0:t.simParams,1:this.gripU,2:this.pickU,3:t.nodes,4:t.x,5:t.dx,6:t.segs,7:this.grip,8:t.ext,9:this.pick,10:this.pickOut,11:this.gripGoal,12:this.initU})}run(e,t,n){e.setPipeline(this.pipes[t]),e.setBindGroup(0,this.group),e.dispatchWorkgroups(n)}async pickAt(e,t,n,r,i,a){let o=ne(e),s=t/r*2-1,c=1-n/i*2,l=j(o,[s,c,0]),u=j(o,[s,c,1]),d=[l[0]/l[3],l[1]/l[3],l[2]/l[3]],f=D(w([u[0]/u[3],u[1]/u[3],u[2]/u[3]],d)),p=/* @__PURE__ */ new Float32Array(32);p.set(e,0),p.set([t,n,a,0],16),p.set([r,i,this.strandRadius,this.windowRadius],20),p.set([...d,0],24),p.set([...f,0],28),this.device.queue.writeBuffer(this.pickU,0,p);let m=/* @__PURE__ */ new Uint32Array(260);m.set([4294967295,4294967295,0,4294967295]),this.device.queue.writeBuffer(this.pick,0,m);let h=this.device.createCommandEncoder({label:`pick`}),g=h.beginComputePass(),_=Math.ceil(this.solver.N/128);for(let e of[`pickRay`,`pickRayNode`,`pickCandidates`,`pickOcclude`])this.run(g,e,_);this.run(g,`pickVisible`,1),this.run(g,`pickWrite`,1),this.run(g,`pickWindow`,1),g.end();let v=this.staging.pop()??this.device.createBuffer({size:1056,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});h.copyBufferToBuffer(this.pickOut,0,v,0,1056),this.device.queue.submit([h.finish()]),await v.mapAsync(GPUMapMode.READ);let y=v.getMappedRange().slice(0);v.unmap(),this.staging.push(v);let b=new Uint32Array(y);if(b[4]===0)return null;let x=new Float32Array(y),S=this.windowRadius;return{node:b[3],position:[x[0],x[1],x[2]],kind:b[4]===1?`surface`:`proximity`,window:{radius:S,bits:b.slice(8,8+(2*S+1)**2)}}}freeSlot(){return this.held.indexOf(null)}holder(e){return this.owner.get(e)??-1}attach(e,t,n=0,r){this.release(n);let i=Ne(this.scene,e,e=>!this.owner.has(e),r);if(!i)return!1;let a=Math.min(i.nodes.length,512),o=/* @__PURE__ */ new ArrayBuffer(32*a),s=new Uint32Array(o),c=new Float32Array(o),l=[],u=[];for(let e=0;e<a;e++)s[8*e]=i.nodes[e],c[8*e+1]=i.weights[e],c[8*e+2]=i.sides[e],l.push(i.nodes[e]),i.weights[e]>=.5&&u.push(i.nodes[e]),this.owner.set(i.nodes[e],n);for(let e of i.between)l.push(e),this.owner.set(e,n);this.held[n]={nodes:l,core:u,stiffness:i.stiffness,releasing:!1},this.device.queue.writeBuffer(this.grip,16384*n,o);let d=/* @__PURE__ */ new Float32Array(12);d.set([t[0],t[1],t[2],a],0),d.set([i.stiffness,L.maxLead,0,1],4),new Uint32Array(d.buffer)[6]=e,d.set([t[0],t[1],t[2],i.padPitch],8),this.device.queue.writeBuffer(this.gripU,48*n,d),this.device.queue.writeBuffer(this.initU,0,new Uint32Array([n,0,0,0]));let f=this.device.createCommandEncoder({label:`gripInit`}),p=f.beginComputePass();return this.run(p,`gripInit`,Math.ceil(a/64)),p.end(),this.device.queue.submit([f.finish()]),!0}setPinch(e,t=0){this.held[t]&&this.device.queue.writeBuffer(this.gripU,48*t+28,new Float32Array([e]))}setHold(e,t=0){let n=this.held[t];n&&this.device.queue.writeBuffer(this.gripU,48*t+16,new Float32Array([n.stiffness*e]))}setTarget(e,t=0){let n=this.held[t];n&&this.device.queue.writeBuffer(this.gripU,48*t,new Float32Array([e[0],e[1],e[2],n.nodes.length]))}letGo(e=0){let t=this.held[e];t&&(t.releasing=!0)}release(e=0){let t=this.held[e];if(t){for(let e of t.nodes)this.owner.delete(e);if(this.held[e]=null,this.device.queue.writeBuffer(this.gripU,48*e+12,new Float32Array([0])),!this.solver.contactEnabled){let e=this.device.createCommandEncoder({label:`gripRelease`});e.clearBuffer(this.solver.ext),this.device.queue.submit([e.finish()])}}}releaseAll(){for(let e=0;e<4;e++)this.release(e)}get active(){return this.held.some(e=>e!==null)}get patchNodes(){return this.held.flatMap(e=>e?.nodes??[])}get coreNodes(){return this.held.flatMap(e=>e&&!e.releasing?e.core:[])}core(e){return this.held[e]?.core??[]}encodeSubstep(e){this.active&&this.run(e,`gripLead`,4)}encode(e){this.active&&e(this.pipes.gripTerms,this.group,32)}};const V={maxSpeed:2.5,maxAccel:60,engageLift:.002,liftPerDrag:.35,maxDragLift:.05,minDepth:-.03,maxDepth:.1},H=(e,t)=>[e[0]+t[0],e[1]+t[1],e[2]+t[2]],Re=(e,t)=>[e[0]-t[0],e[1]-t[1],e[2]-t[2]],U=(e,t)=>[e[0]*t,e[1]*t,e[2]*t],W=e=>Math.hypot(e[0],e[1],e[2]);var ze=class{anchor;toward;age=0;depth=0;offset=[0,0,0];vel=[0,0,0];constructor(e,t){this.anchor=[...e];let n=W(t);this.toward=U(t,1/n)}get target(){return H(this.anchor,this.offset)}get pinch(){return R(this.age)}get engagement(){return Math.min(1,this.age/L.engageTime)}wheel(e){this.depth=Math.max(V.minDepth,Math.min(V.maxDepth,this.depth+e))}goal(e){let t=e[0]*this.toward[0]+e[1]*this.toward[1]+e[2]*this.toward[2],n=W(Re(e,U(this.toward,t))),r=V.engageLift*this.engagement+Math.min(V.maxDragLift,V.liftPerDrag*n),i=Math.max(-t,r+this.depth);return H(e,U(this.toward,i))}step(e,t){this.age+=e;let n=Re(this.goal(t),this.offset),r=W(n),i=Math.min(V.maxSpeed,Math.sqrt(2*V.maxAccel*r),r/e),a=r>0?U(n,i/r):[0,0,0],o=Re(a,this.vel),s=W(o),c=V.maxAccel*e;this.vel=s>c?H(this.vel,U(o,c/s)):a,this.offset=H(this.offset,U(this.vel,e))}},Be=class{samples;upTime=1/0;constructor(e){this.samples=[e]}get first(){return this.samples[0]}get last(){return this.samples[this.samples.length-1]}add(e){e.time<this.last.time||this.samples.push(e)}at(e){let t=this.samples,n=e>=t[t.length-1].time?t[t.length-1]:e<=t[0].time?t[0]:null;if(n)return{x:n.x,y:n.y};let r=0,i=t.length-1;for(;i-r>1;){let n=r+i>>1;t[n].time<=e?r=n:i=n}let a=t[r],o=t[i],s=o.time>a.time?(e-a.time)/(o.time-a.time):1;return{x:a.x+(o.x-a.x)*s,y:a.y+(o.y-a.y)*s}}prune(e){let t=this.samples,n=1;for(;n+1<t.length&&t[n+1].time<=e;)n++;n>1&&t.splice(1,n-1)}};function G(e){return Math.ceil((e-1)/2)+1}function Ve(e){let t=0;return e.map(e=>{let n={nx:G(e.nx),ny:G(e.ny),offset:t};return t+=n.nx*n.ny,n})}function He(e,t=48){return e.every(e=>e.nx*e.ny>t&&e.nx>=5&&e.ny>=5)}function Ue(e,t=48){let n=[e];for(;;){let e=n[n.length-1];if(We(e)<=t||!He(e))break;n.push(Ve(e))}return n}function We(e){return e.reduce((e,t)=>e+t.nx*t.ny,0)}function Ge(e,t=3){let n=Array.from({length:2*t},()=>[]),r=0;for(let i of e){for(let e=0;e<i.nx;e++)n[e%t].push([i.offset+e,i.nx,i.ny,1]),r=Math.max(r,i.ny);for(let e=0;e<i.ny;e++)n[t+e%t].push([i.offset+e*i.nx,1,i.nx,0]),r=Math.max(r,i.nx)}let i=[0],a=[];for(let e of n){for(let t of e)a.push(...t);i.push(i[i.length-1]+e.length)}return{lines:new Uint32Array(a),colorStart:i,maxLength:r}}var Ke=`// Cross-layer contact between crossing nodes. The contact distance (midsurface separation of two plies,
 // ~0.85 mm) is about twice the crossing spacing, so the summed node-node penalty field is a smooth
 // sheet-like barrier that still opens where material is missing. Detection runs once per substep on a
 // spatial hash keyed by (cell, layer) and also produces an OGC-style displacement bound per node;
@@ -5108,7 +5564,8 @@ struct ContactU {
 @group(0) @binding(7) var<storage, read_write> cellCursor: array<atomic<u32>>;
 @group(0) @binding(8) var<storage, read_write> cellItems: array<u32>;
 @group(0) @binding(9) var<storage, read_write> pairs: array<u32>;
-@group(0) @binding(10) var<storage, read_write> cmeta: array<vec4<f32>>; // dx at detection, bound
+// 2 per node (selfcontact.wgsl): own bound (normal, largest approach), reciprocal bound (none here)
+@group(0) @binding(10) var<storage, read_write> cmeta: array<vec4<f32>>;
 @group(0) @binding(11) var<storage, read_write> ext: array<vec4<f32>>;  // 3 per node
 
 fn layerOf(n: u32) -> u32 { return nodes[n].ijl >> 24u; }
@@ -5201,10 +5658,11 @@ fn detect(@builtin(global_invocation_id) gid: vec3<u32>) {
   // Directional bound (step.wgsl newtonApply): the step may approach the nearest foreign node only by
   // a share of its clearance plus half the contact distance, so it cannot tunnel through a layer.
   if (dmin < 1e8) {
-    cmeta[n] = vec4<f32>(nmin, CU.law.w * (max(0.0, dmin) + 0.5 * CU.dist.x));
+    cmeta[2u * n] = vec4<f32>(nmin, CU.law.w * (max(0.0, dmin) + 0.5 * CU.dist.x));
   } else {
-    cmeta[n] = vec4<f32>(0.0, 0.0, 0.0, 1e9);
+    cmeta[2u * n] = vec4<f32>(0.0, 0.0, 0.0, 1e9);
   }
+  cmeta[2u * n + 1u] = vec4<f32>(0.0, 0.0, 0.0, 1e9);
 }
 
 @compute @workgroup_size(128)
@@ -5242,7 +5700,7 @@ fn terms(@builtin(global_invocation_id) gid: vec3<u32>) {
   ext[3u * n + 1u] = vec4<f32>(H[0].x, H[0].y, H[0].z, H[1].y);
   ext[3u * n + 2u] = vec4<f32>(H[1].z, H[2].z, 0.0, 0.0);
 }
-`;const U={cell:.001,tableBits:20,stiffness:3e3,friction:.45,frictionSpeed:.002,boundFraction:.45};var W=class{meta;s;mod;scan;pipes={};group;scanGroups=[];cells;constructor(e,t){this.s=e;let n=e.device;this.cells=1<<U.tableBits;let r=t.layers.map(e=>e.material.thickness),s=(e,t)=>.5*((r[e]??0)+(r[t]??0)),c=/* @__PURE__ */ new Float32Array(12);c.set([U.cell,0,0,0],0),new Uint32Array(c.buffer)[1]=this.cells-1,c.set([U.stiffness,U.friction,U.frictionSpeed,U.boundFraction],4),c.set([s(0,1),s(0,2),s(1,2),0],8);let l=o(n,`contactU`,c,i);this.uniform=l,this.law=c.slice(4,8);let u=a(n,`contact.cellCount`,4*this.cells),d=a(n,`contact.cellCursor`,4*this.cells),p=a(n,`contact.cellItems`,4*e.N),m=a(n,`contact.pairs`,16*e.N);this.meta=a(n,`contact.meta`,16*e.N),this.mod=new f(n,`contact`,_+Re);for(let e of[`hashCount`,`hashFill`,`detect`,`terms`])this.pipes[e]=this.mod.pipeline(e);this.group=this.mod.bindGroup(`contact`,{0:e.simParams,1:l,2:e.nodes,3:e.x,4:e.dx,5:e.segs,6:u,7:d,8:p,9:m,10:this.meta,11:e.ext}),this.scan=new f(n,`scan`,y),this.pipes.scanBlocks=this.scan.pipeline(`scanBlocks`),this.pipes.addBlockSums=this.scan.pipeline(`addBlockSums`);let h=this.cells,g=u;for(;;){let e=Math.ceil(h/512),t=a(n,`scan.sums${this.scanGroups.length}`,4*Math.max(e,4)),r=o(n,`scanU`,new Uint32Array([h,0,0,0]),i);if(this.scanGroups.push({scan:this.scan.bindGroup(`scan`,{0:r,1:g,2:t}),add:this.scan.bindGroup(`scanAdd`,{0:r,1:g,2:t}),blocks:e}),e===1)break;g=t,h=e}this.cellCount=u,this.cellCursor=d}uniform;law;setEnabled(e){let t=e?this.law:new Float32Array([0,0,this.law[2],this.law[3]]);this.s.device.queue.writeBuffer(this.uniform,16,t)}cellCount;cellCursor;run(e,t,n,r=this.group){e.setPipeline(this.pipes[t]),e.setBindGroup(0,r),e.dispatchWorkgroups(n)}encodeClear(e){e.clearBuffer(this.cellCount),e.clearBuffer(this.cellCursor)}encodeDetect(e){let t=Math.ceil(this.s.N/128);this.run(e,`hashCount`,t);for(let t of this.scanGroups)this.run(e,`scanBlocks`,t.blocks,t.scan);for(let t=this.scanGroups.length-2;t>=0;t--)this.run(e,`addBlockSums`,this.scanGroups[t].blocks,this.scanGroups[t].add);this.run(e,`hashFill`,t),this.run(e,`detect`,t)}encodeTerms(e){this.run(e,`terms`,Math.ceil(this.s.N/128))}},ze=`// Fine-level operator rows: 18 vec4 per node. Block b (0 = diagonal, 1..8 = couplings
+`;const K={cell:.001,tableBits:20,stiffness:3e3,friction:.45,frictionSpeed:.002,boundFraction:.45};var qe=class{meta;s;mod;scan;pipes={};group;scanGroups=[];cells;constructor(e,t){this.s=e;let n=e.device;this.cells=1<<K.tableBits;let r=t.layers.map(e=>e.material.thickness),s=(e,t)=>.5*((r[e]??0)+(r[t]??0)),c=/* @__PURE__ */ new Float32Array(12);c.set([K.cell,0,0,0],0),new Uint32Array(c.buffer)[1]=this.cells-1,c.set([K.stiffness,K.friction,K.frictionSpeed,K.boundFraction],4),c.set([s(0,1),s(0,2),s(1,2),0],8);let l=o(n,`contactU`,c,i);this.uniform=l,this.law=c.slice(4,8);let u=a(n,`contact.cellCount`,4*this.cells),d=a(n,`contact.cellCursor`,4*this.cells),p=a(n,`contact.cellItems`,4*e.N),m=a(n,`contact.pairs`,16*e.N);this.meta=a(n,`contact.meta`,32*e.N),this.mod=new f(n,`contact`,_+Ke);for(let e of[`hashCount`,`hashFill`,`detect`,`terms`])this.pipes[e]=this.mod.pipeline(e);this.group=this.mod.bindGroup(`contact`,{0:e.simParams,1:l,2:e.nodes,3:e.x,4:e.dx,5:e.segs,6:u,7:d,8:p,9:m,10:this.meta,11:e.ext}),this.scan=new f(n,`scan`,y),this.pipes.scanBlocks=this.scan.pipeline(`scanBlocks`),this.pipes.addBlockSums=this.scan.pipeline(`addBlockSums`);let h=this.cells,g=u;for(;;){let e=Math.ceil(h/512),t=a(n,`scan.sums${this.scanGroups.length}`,4*Math.max(e,4)),r=o(n,`scanU`,new Uint32Array([h,0,0,0]),i);if(this.scanGroups.push({scan:this.scan.bindGroup(`scan`,{0:r,1:g,2:t}),add:this.scan.bindGroup(`scanAdd`,{0:r,1:g,2:t}),blocks:e}),e===1)break;g=t,h=e}this.cellCount=u,this.cellCursor=d}uniform;law;setEnabled(e){let t=e?this.law:new Float32Array([0,0,this.law[2],this.law[3]]);this.s.device.queue.writeBuffer(this.uniform,16,t)}cellCount;cellCursor;run(e,t,n,r=this.group){e.setPipeline(this.pipes[t]),e.setBindGroup(0,r),e.dispatchWorkgroups(n)}encodeClear(e){e.clearBuffer(this.cellCount),e.clearBuffer(this.cellCursor)}encodeDetect(e){let t=Math.ceil(this.s.N/128);this.run(e,`hashCount`,t);for(let t of this.scanGroups)this.run(e,`scanBlocks`,t.blocks,t.scan);for(let t=this.scanGroups.length-2;t>=0;t--)this.run(e,`addBlockSums`,this.scanGroups[t].blocks,this.scanGroups[t].add);this.run(e,`hashFill`,t),this.run(e,`detect`,t)}encodeTerms(e){this.run(e,`terms`,Math.ceil(this.s.N/128))}},Je=`// Fine-level operator rows: 18 vec4 per node. Block b (0 = diagonal, 1..8 = couplings
 // +u, -u, +v, -v, +u+v, -u-v, -u+v, +u-v) occupies vec4 2b = (xx, xy, xz, yy) and 2b+1 = (yz, zz, *, *).
 // The four scalar bending 2-hop couplings live in spare lanes: vec4 1.zw = (+2u, -2u),
 // vec4 3.zw = (+2v, -2v). Requires a module-scope \`op: array<vec4<f32>>\`.
@@ -5283,7 +5741,7 @@ fn rowCoupling(n: u32, k: u32) -> Sym {
   let s = op[r + select(1u, 3u, k >= 10u)];
   return symId(select(s.z, s.w, (k & 1u) == 1u));
 }
-`,Be=`// Coarse-level operator rows: 50 vec4 per node. Block 0 is the diagonal, blocks 1..24 the
+`,Ye=`// Coarse-level operator rows: 50 vec4 per node. Block 0 is the diagonal, blocks 1..24 the
 // radius-2 couplings in offset order (dj, di) = (-2..2, -2..2) skipping the center; block b uses
 // vec4 2b = (xx, xy, xz, yy) and 2b+1 = (yz, zz, 0, 0). Requires \`op: array<vec4<f32>>\`.
 
@@ -5315,7 +5773,7 @@ fn rowCoupling(n: u32, k: u32) -> Sym {
   let r = n * ROW_VEC4 + 2u * k + 2u;
   return symFromVec4(op[r], op[r + 1u]);
 }
-`,G=`// Fine-level Newton system assembly: projected Hessian row (upper-half stencil) and rhs = -grad.
+`,Xe=`// Fine-level Newton system assembly: projected Hessian row (upper-half stencil) and rhs = -grad.
 // Mirrors ReferenceSolver.nodeGradient and assembleFineOperator (reference/newtonMultigrid.ts).
 
 @group(0) @binding(0) var<uniform> P: SimParams;
@@ -5570,7 +6028,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   for (var k = 0u; k < 4u; k++) { storeSym(row + 10u + 2u * k, CD[k], vec2<f32>(0.0)); }
   rhs[n] = vec4<f32>(-g, 0.0);
 }
-`,Ve=`// Galerkin multigrid kernels on lattice stencils, compiled with the row reader of the finer level
+`,Ze=`// Galerkin multigrid kernels on lattice stencils, compiled with the row reader of the finer level
 // (rowfine.wgsl or rowcoarse.wgsl). Coarse rows are always written in the coarse layout.
 // Mirrors galerkin / vcycle in reference/newtonMultigrid.ts.
 
@@ -5610,6 +6068,9 @@ fn weightOf(i: u32, I: u32, n: u32) -> f32 {
 // Whether the level-F node at (i, j) and its unit-offset neighbour are connected: an intact span on
 // the fine lattice; on coarse levels a nonzero Galerkin coupling (pieces separated by a tear have
 // none) or a fixed neighbour (mount boundaries keep their bilinear weights).
+// a span links its nodes while it carries load (newtonMultigrid.ts LINK_MIN_INTACT)
+const LINK_MIN_INTACT: f32 = 0.02;
+
 fn linked(l: u32, i: i32, j: i32, di: i32, dj: i32) -> bool {
   let a = levelNode(F, l, i, j);
   let b = levelNode(F, l, i + di, j + dj);
@@ -5617,7 +6078,8 @@ fn linked(l: u32, i: i32, j: i32, di: i32, dj: i32) -> bool {
   if (FINE_ROWS) {
     let f = select(1u, 0u, di != 0);
     let owner = select(b, a, di + dj > 0);
-    return segActive(segsF[2u * u32(owner) + f]);
+    let sg = segsF[2u * u32(owner) + f];
+    return segActive(sg) && sg.intact > LINK_MIN_INTACT;
   }
   if (fixedF[u32(b)] != 0u) { return true; }
   return !symIsZero(rowCoupling(u32(a), couplingIndex(vec2<i32>(di, dj))));
@@ -5824,7 +6286,7 @@ fn prolongAdd(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
   vecOut[a] = vec4<f32>(vecOut[a].xyz + s, 0.0);
 }
-`,He=`// Yarn-line smoother. One 64-thread workgroup solves one line exactly as a block-tridiagonal system
+`,Qe=`// Yarn-line smoother. One 64-thread workgroup solves one line exactly as a block-tridiagonal system
 // with the partition method: each of up to 32 threads eliminates a contiguous chunk in thread-private
 // scratch, expressing interior unknowns as x_i = v_i + V_i x_s + W_i x_e in terms of its chunk ends;
 // the 2P chunk-end equations form a small block-tridiagonal system, solved in workgroup memory by
@@ -6057,7 +6519,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     }
   }
 }
-`,Ue=`// PCG vector kernels on the fine level. Scalars stay on the GPU: slot 2k = r.z of iteration k,
+`,$e=`// PCG vector kernels on the fine level. Scalars stay on the GPU: slot 2k = r.z of iteration k,
 // slot 2k+1 = p.Ap of iteration k. Mirrors pcg() in reference/newtonMultigrid.ts.
 
 const RED: u32 = 256u;
@@ -6174,7 +6636,7 @@ fn clear2(@builtin(global_invocation_id) gid: vec3<u32>) {
   va[n] = vec4<f32>(0.0);
   vb[n] = vec4<f32>(0.0);
 }
-`,We=`// Per-substep kernels outside the linear solve: predictor, Newton update, commit, friction-limited
+`,et=`// Per-substep kernels outside the linear solve: predictor, Newton update, commit, friction-limited
 // crossing slip (damage and rupture: yarnfield.wgsl). Mirrors ReferenceSolver (reference/solver.ts).
 
 @group(0) @binding(0) var<uniform> P: SimParams;
@@ -6190,8 +6652,10 @@ fn clear2(@builtin(global_invocation_id) gid: vec3<u32>) {
 // [0] ruptures, [1] pulled out, [2] max speed (f32 bits), [3] line-search step length (f32 bits),
 // [4 + k] largest update of Newton iteration k
 @group(0) @binding(10) var<storage, read_write> counters: array<atomic<u32>>;
-// contact bound per node: unit normal away from its nearest face (or foreign node) at the start of the
-// substep, and the largest step displacement allowed toward it (zero normal: unbounded)
+// contact bounds per node (selfcontact.wgsl detect / resolveBounds): [2n] unit normal away from the
+// face it is bounded against and the largest step displacement allowed toward it; [2n + 1] for a face
+// corner, the direction toward the node bounded against that face and the largest step along it (zero
+// direction: unbounded)
 @group(0) @binding(11) var<storage, read> cmeta: array<vec4<f32>>;
 
 fn historyTolerance() -> f32 { return bitcast<f32>(P.counts.w); }
@@ -6248,22 +6712,42 @@ fn predict(@builtin(global_invocation_id) gid: vec3<u32>) {
   dx[n] = vec4<f32>(hv, 0.0);
 }
 
+// A half-space bound: the step may move against direction m.xyz by at most m.w.
+fn bound(d: vec3<f32>, m: vec4<f32>) -> vec3<f32> {
+  let approach = -dot(d, m.xyz);
+  return select(d, d + (approach - m.w) * m.xyz, approach > m.w);
+}
+
+// The step d made feasible for node n's contact bounds (OGC-style, directional: it may approach the
+// face it is bounded against only by its share of the clearance, and a face corner may approach the
+// node bounded against it only by that node's share; motion along the face stays free). Alternating
+// projections onto the two half-spaces; both are kept to within rounding when their normals agree.
+fn feasible(n: u32, d: vec3<f32>) -> vec3<f32> {
+  let own = cmeta[2u * n];
+  let recip = cmeta[2u * n + 1u];
+  return bound(bound(bound(d, own), recip), own);
+}
+
+// After contact detection: the predicted step made feasible (the first Newton iteration starts from a
+// state that respects the bounds; the clipped approach is lost, as in an inelastic contact).
+@compute @workgroup_size(128)
+fn projectStart(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let n = gid.x;
+  if (n >= P.counts.x || pinnedN(n)) { return; }
+  dx[n] = vec4<f32>(feasible(n, dx[n].xyz), dx[n].w);
+}
+
 @compute @workgroup_size(128)
 fn newtonApply(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = gid.x;
   if (n >= P.counts.x) { return; }
   if (pinnedN(n)) { return; }
-  let m = cmeta[n];
   let old = dx[n].xyz;
   // step length chosen by the line search (energy.wgsl)
   let alpha = bitcast<f32>(atomicLoad(&counters[3]));
   // firewall: a non-finite direction never enters the state
   let dn = select(vec3<f32>(0.0), delta[n].xyz, finite3(delta[n].xyz) && finite1(alpha));
-  var nd = old + alpha * dn;
-  // OGC-style feasibility, directional: the step may approach the nearest face only by the allowed
-  // share of its clearance (it can never pass through it); motion along the face stays free
-  let approach = -dot(nd, m.xyz);
-  if (approach > m.w) { nd += (approach - m.w) * m.xyz; }
+  let nd = feasible(n, old + alpha * dn);
   // w keeps the size of this node's latest Newton update (local convergence for history updates)
   dx[n] = vec4<f32>(nd, length(nd - old));
   // non-negative f32 bit patterns order like their values
@@ -6286,7 +6770,7 @@ fn commit(@builtin(global_invocation_id) gid: vec3<u32>) {
     // cloth (the clipped normal velocity is lost, inelastic). Resting on it (within DEBRIS_REST of the
     // core), Coulomb friction with the supporting component of gravity slows its sliding by up to
     // mu |g.n| h per step: a scrap stays put on slopes below atan(mu)
-    let m = cmeta[n];
+    let m = cmeta[2u * n];
     if (any(m.xyz != vec3<f32>(0.0))) {
       let approach = -dot(d1, m.xyz);
       if (approach > m.w) { d1 += (approach - m.w) * m.xyz; }
@@ -6395,7 +6879,7 @@ fn slip(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
 }
-`,Ge=`// Yarn damage field (src/simulation/yarnField.ts, mirrored exactly): per crossing the damage of its
+`,tt=`// Yarn damage field (src/simulation/yarnField.ts, mirrored exactly): per crossing the damage of its
 // warp and pick segments, advanced after each substep from the strain interpolated from the active
 // parallel spans around it; the spans then take their intact fraction from it, and a span whose yarns
 // have all separated ruptures. Passes, in order: spanStrain (strain snapshot per span), fieldUpdatePick
@@ -6828,7 +7312,7 @@ fn couple(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
   segs[s] = sg;
 }
-`;function Ke(e){let t=0;return{layers:e.map(e=>{let n={offset:t,K:e.nx*e.bundle[0],M:e.ny*e.bundle[1],bu:e.bundle[0],bv:e.bundle[1]};return t+=n.K*n.M,n}),count:t}}function K(e,t){return t===1?e.bu:e.bv}function qe(e){return Math.max(1,Math.min(255,Math.round(e*255)))}function Je(e){return Math.max(.02,e/255)}function Ye(e,t,n,r,i,a){return r===1?e.offset+(n*e.bv+Math.floor(e.bv/2)+a)*e.K+t*e.bu+i:e.offset+(n*e.bv+i)*e.K+t*e.bu+Math.floor(e.bu/2)+a}function Xe(e,t){return t===1?e.bv:e.bu}const Ze={fraction:.6,maxRun:6,reach:.0012};function Qe(e,t){return Math.max(1,Math.round(Ze.reach/(t===1?e.pitchV:e.pitchU)))}function $e(e,t,n,r,i,a,o){let s=0;return e.forEach((e,c)=>{let l=t[c];for(let t=0;t<e.ny;t++)for(let c=0;c<e.nx;c++)for(let u=0;u<2;u++){if(u===0&&c>=e.nx-1||u===1&&t>=e.ny-1)continue;let d=e.nodeOffset+t*e.nx+c,f=2*d+u;if(!a(f))continue;let p=K(l,u),m=Xe(l,u),h=0,g=0,_=0;for(let e=0;e<p;e++){let i=0,a=-1,o=0;for(let s=0;s<m;s++){let d=Ye(l,c,t,u,e,s),f=r[2*d+u];f>i&&(i=f),f>=254&&a<0&&(a=s),o+=1/Je(n[2*d+u])}h+=(i>=254?0:1-i/255)*(m/o),i>=254&&(g|=1<<e,_+=(a+.5)/m)}if(i.intact[f]=h/p,i.cutMask[f]=g>>>0,g===(p===32?4294967295:(1<<p)-1)>>>0){let t=_/p,n=i.restLength[f],r=u===0?d+1:d+e.nx;i.segFlags[f]|=o,i.failSite[f]=t,i.tails[4*d+2*u+1]+=n*t,i.tails[4*r+2*u]+=n*(1-t),s++}}}),s}const et={fracture:0,pan:1,cuts:2};function tt(e){return 1+e*3}function nt(e,t,n){let r=t+n*6,i=e[r+4];if(i===0)return null;let a=new Int32Array(e.buffer,e.byteOffset+4*(r+1),3);return[a[0]/(1e3*i),a[1]/(1e3*i),a[2]/(1e3*i)]}function rt(e,t,n,r,i,a){n[r]=i;for(let i=0;i<4;i++){let o=t+i*6,s=r+tt(i);n[s+et.fracture]=e[o]*1e-5,n[s+et.pan]=a[i],n[s+et.cuts]=e[o+5]}}var it=`// Adaptive Newton gate (see GpuSolver.encodeSubstep).
+`;function nt(e){let t=0;return{layers:e.map(e=>{let n={offset:t,K:e.nx*e.bundle[0],M:e.ny*e.bundle[1],bu:e.bundle[0],bv:e.bundle[1]};return t+=n.K*n.M,n}),count:t}}function rt(e,t){return t===1?e.bu:e.bv}function it(e){return Math.max(1,Math.min(255,Math.round(e*255)))}function at(e){return Math.max(.02,e/255)}function ot(e,t,n,r,i,a){return r===1?e.offset+(n*e.bv+Math.floor(e.bv/2)+a)*e.K+t*e.bu+i:e.offset+(n*e.bv+i)*e.K+t*e.bu+Math.floor(e.bu/2)+a}function st(e,t){return t===1?e.bv:e.bu}const ct={fraction:.6,maxRun:6,reach:.0012};function lt(e,t){return Math.max(1,Math.round(ct.reach/(t===1?e.pitchV:e.pitchU)))}function ut(e,t,n,r,i,a,o){let s=0;return e.forEach((e,c)=>{let l=t[c];for(let t=0;t<e.ny;t++)for(let c=0;c<e.nx;c++)for(let u=0;u<2;u++){if(u===0&&c>=e.nx-1||u===1&&t>=e.ny-1)continue;let d=e.nodeOffset+t*e.nx+c,f=2*d+u;if(!a(f))continue;let p=rt(l,u),m=st(l,u),h=0,g=0,_=0;for(let e=0;e<p;e++){let i=0,a=-1,o=0;for(let s=0;s<m;s++){let d=ot(l,c,t,u,e,s),f=r[2*d+u];f>i&&(i=f),f>=254&&a<0&&(a=s),o+=1/at(n[2*d+u])}h+=(i>=254?0:1-i/255)*(m/o),i>=254&&(g|=1<<e,_+=(a+.5)/m)}if(i.intact[f]=h/p,i.cutMask[f]=g>>>0,g===(p===32?4294967295:(1<<p)-1)>>>0){let t=_/p,n=i.restLength[f],r=u===0?d+1:d+e.nx;i.segFlags[f]|=o,i.failSite[f]=t,i.tails[4*d+2*u+1]+=n*t,i.tails[4*r+2*u]+=n*(1-t),s++}}}),s}new Float64Array([1,0,0,0,1,0,0,0,1]);const dt={fracture:0,pan:1,cuts:2};function ft(e){return 1+e*3}function pt(e,t,n){let r=t+n*6,i=e[r+4];if(i===0)return null;let a=new Int32Array(e.buffer,e.byteOffset+4*(r+1),3);return[a[0]/(1e3*i),a[1]/(1e3*i),a[2]/(1e3*i)]}function mt(e,t,n,r,i,a){n[r]=i;for(let i=0;i<4;i++){let o=t+i*6,s=r+ft(i);n[s+dt.fracture]=e[o]*1e-5,n[s+dt.pan]=a[i],n[s+dt.cuts]=e[o+5]}}var ht=`// Adaptive Newton gate (see GpuSolver.encodeSubstep).
 
 @group(0) @binding(0) var<uniform> Mode: vec4<u32>; // x = Newton iteration just completed
 @group(0) @binding(1) var<storage, read> counters: array<u32>; // [4 + k] largest update of iteration k (f32 bits)
@@ -6852,7 +7336,7 @@ fn gate(@builtin(global_invocation_id) gid: vec3<u32>) {
   gateArgs[base + 3u * k + 2u] = 1u;
 }
 
-`,at=`// Newton line search: change of the incremental potential along the Newton direction (delta) for
+`,gt=`// Newton line search: change of the incremental potential along the Newton direction (delta) for
 // step lengths alpha in {1, 1/2, 1/4, 1/8}, as sums of per-term differences (stable in f32: no
 // subtraction of large totals), each with a rounding scale (the sum of the magnitudes of its terms)
 // that decides whether a difference is conclusive (lineChoose). Each node owns its inertia/external/drag terms, its "+" spans, the
@@ -7105,7 +7589,7 @@ fn lineChoose(@builtin(local_invocation_index) lid: u32) {
     counters[3] = bitcast<u32>(a);
   }
 }
-`,ot=`// Implicit air drag of a node: energy 1/2 dx^T D dx per substep with D built from the accepted state
+`,_t=`// Implicit air drag of a node: energy 1/2 dx^T D dx per substep with D built from the accepted state
 // (a fixed quadratic within the substep, exact for Newton). Requires module-scope \`P: SimParams\`,
 // \`nodes\`, \`x\` and \`segs\`. Mirrors ReferenceSolver.airDrag.
 //
@@ -7162,7 +7646,7 @@ fn airDragBlock(n: u32) -> Sym {
   }
   return symId(k);
 }
-`;const st={h:1/120,gravity:[0,0,-9.81],newtonIterations:2,newtonMax:2,newtonTolerance:1e-5,historyTolerance:1,pcgIterations:2,coarseSweeps:2,maxCoarsestNodes:400,selfContact:!0};function ct(e,t){let n=/* @__PURE__ */ new ArrayBuffer(368),r=new Float32Array(n),i=new Uint32Array(n);return r[0]=t.h,r[1]=t.gravity[0],r[2]=t.gravity[1],r[3]=t.gravity[2],i[4]=e.nodeCount,i[5]=e.layers.length,i[6]=1,r[7]=t.historyTolerance,e.layers.forEach((e,t)=>{let n=(32+t*112)/4;i[n]=e.nodeOffset,i[n+1]=e.nx,i[n+2]=e.ny;for(let t=0;t<2;t++){let i=e.material.yarns[t],a=n+4+t*8;r[a]=i.eaLow,r[a+1]=i.eaHigh,r[a+2]=i.crimpStrain,r[a+3]=i.eaCompress,r[a+4]=i.axialViscosity,r[a+5]=i.bendRigidity,r[a+6]=i.bendViscosity,r[a+7]=i.yarnsPerSpan??1}let a=e.material;r[n+20]=a.shearStiffness,r[n+21]=a.crossingFriction,r[n+22]=a.crossingWrap,r[n+23]=a.pitchU,r[n+24]=a.pitchV,r[n+25]=a.airDrag,r[n+26]=a.crossingNormal0}),n}function lt(e,t){let n=new Uint32Array(e.length/2);for(let r=0;r<n.length;r++)n[r]=(e[2*r]|e[2*r+1]<<8|t[2*r]<<16|t[2*r+1]<<24)>>>0;return n}function ut(e){let t=/* @__PURE__ */ new Uint32Array(16);return t[0]=V(e),t[1]=e.length,e.forEach((e,n)=>{t[4+4*n]=e.offset,t[5+4*n]=e.nx,t[6+4*n]=e.ny}),t}var dt=class{device;scene;params;N;simParams;nodes;x;v;dx;pred;segs;tails;ext;field;fieldStrength;fieldU;fieldEvents;pullBits;counters;acousticSources;contact;contactEnabled;gateArgs;gateSizes;sizeIndex=/* @__PURE__ */ new Map;gatedIteration=-1;levels;delta;p;Ap;rec;partial;partial4;scal;slots;slotCount=0;slotData;pl={};bg={};mod={};preSubstep=null;preAssemble=null;constructor(e,t,n=st){this.device=e,this.scene=t,this.params={...n};let r=t.nodeCount;this.N=r,this.simParams=o(e,`simParams`,new Uint8Array(ct(t,n)),i);let s=/* @__PURE__ */ new ArrayBuffer(16*r),c=new Uint32Array(s),l=new Float32Array(s);for(let e of t.layers)for(let n=0;n<e.ny;n++)for(let r=0;r<e.nx;r++){let i=e.nodeOffset+n*e.nx+r;c[4*i]=r|n<<12|e.index<<24,c[4*i+1]=t.pinned[i],l[4*i+2]=t.mass[i],l[4*i+3]=t.crossingNormal0[i]}if(t.layers.some(e=>e.nx>=4096||e.ny>=4096))throw Error(`lattice too large for ijl packing`);this.nodes=o(e,`nodes`,new Uint8Array(s));let u=new Float32Array(4*r);for(let e=0;e<r;e++)for(let n=0;n<3;n++)u[4*e+n]=t.position[3*e+n];if(this.x=o(e,`x`,u),this.v=a(e,`v`,16*r),this.dx=a(e,`dx`,16*r),this.pred=a(e,`pred`,16*r),this.segs=o(e,`segs`,new Uint8Array(this.segData(t))),t.layers.some(e=>e.bundle[0]>16||e.bundle[1]>16))throw Error(`bundles of more than 16 yarns are not supported by the GPU field update`);this.field=o(e,`field`,lt(t.fieldDamage,t.fieldArea)),this.fieldStrength=o(e,`fieldStrength`,t.fieldStrength);let d=/* @__PURE__ */ new Uint32Array(12);t.field.forEach((e,n)=>d.set([e.offset,e.K,e.M,Qe(t.layers[n].weave,0)|Qe(t.layers[n].weave,1)<<16],4*n)),this.fieldU=o(e,`fieldU`,d,i),this.fieldEvents=o(e,`fieldEvents`,new Uint32Array([1,0,0,0])),this.pullBits=a(e,`pullBits`,4*Math.ceil(t.fieldDamage.length/2/16)),this.tails=o(e,`tails`,Float32Array.from(t.tails)),this.ext=a(e,`ext`,48*r),this.counters=a(e,`counters`,160),this.acousticSources=a(e,`acousticSources`,64,i),this.contactEnabled=t.layers.length>1||this.params.selfContact;let f=t.layers.map(e=>({nx:e.nx,ny:e.ny,offset:e.nodeOffset}));if(this.levels=Le(f,this.params.maxCoarsestNodes).map((n,s)=>{let c=V(n),l=H(n,3);if(l.maxLength>384)throw Error(`yarn line of ${l.maxLength} exceeds 384`);let u=new Uint32Array(c);if(s===0)for(let e=0;e<r;e++)u[e]=t.pinned[e];return{layers:n,N:c,info:o(e,`level${s}.info`,ut(n),i),op:a(e,`level${s}.op`,c*(s===0?72:200)*4),fixed:o(e,`level${s}.fixed`,u),X:a(e,`level${s}.X`,16*c),B:a(e,`level${s}.B`,16*c),R:a(e,`level${s}.R`,16*c),lines:o(e,`level${s}.lines`,l.lines),table:l,pw:null}}),this.delta=a(e,`pcg.delta`,16*r),this.p=a(e,`pcg.p`,16*r),this.Ap=a(e,`pcg.Ap`,16*r),this.rec=a(e,`smooth.scratch`,160*r),this.partial=a(e,`pcg.partial`,1024),this.partial4=a(e,`lineSearch.partial`,8192),this.scal=a(e,`pcg.scal`,512),this.slotData=/* @__PURE__ */ new Uint32Array(16384),this.slots=a(e,`slots`,this.slotData.byteLength,i),n.newtonMax>8||n.newtonIterations<1||n.newtonIterations>n.newtonMax)throw Error(`invalid Newton iteration bounds`);if(this.contact=t.layers.length>1?new W(this,t):new x(this),!this.contactEnabled){let t=new Float32Array(4*r);for(let e=0;e<r;e++)t[4*e+3]=1e9;e.queue.writeBuffer(this.contact.meta,0,t)}let p=[];this.createPipelines(),this.createBindGroups(),this.encodeNewtonIteration({setPipeline(){},setBindGroup(){},dispatchWorkgroups(e){p.includes(e)||p.push(e)},end(){}},0,!0),p.includes(32)||p.push(32),p.forEach((e,t)=>this.sizeIndex.set(e,t)),this.gateSizes=o(e,`newton.gateSizes`,new Uint32Array([p.length,new Uint32Array(new Float32Array([n.newtonTolerance]).buffer)[0],...p])),this.gateArgs=a(e,`newton.gateArgs`,12*p.length*9,GPUBufferUsage.STORAGE|GPUBufferUsage.INDIRECT|GPUBufferUsage.COPY_DST),this.createStepBindGroups(),e.queue.writeBuffer(this.slots,0,this.slotData)}segData(e){let t=this.scene,n=/* @__PURE__ */ new ArrayBuffer(64*t.nodeCount),r=new Float32Array(n),i=new Uint32Array(n);for(let n=0;n<2*t.nodeCount;n++)r[8*n]=e.restLength[n],r[8*n+1]=e.intact[n],r[8*n+2]=t.softening[n],i[8*n+3]=e.cutMask[n],i[8*n+5]=e.segFlags[n],r[8*n+6]=e.failSite[n];return n}slot(e,t=0,n=0,r=0){let i=this.slotCount++;if(i>=256)throw Error(`out of uniform slots`);let a=i*256/4;return this.slotData[a]=e>>>0,this.slotData[a+1]=t>>>0,this.slotData[a+2]=n>>>0,this.slotData[a+3]=r>>>0,{buffer:this.slots,offset:i*256,size:16}}createPipelines(){let e=this.device,t=this.params.patch??((e,t)=>t);this.mod.assemble=new f(e,`assemble`,t(`assemble`,_+ot+G)),this.mod.mgFine=new f(e,`multigrid.fine`,t(`multigrid`,_+Ve+ze)),this.mod.mgCoarse=new f(e,`multigrid.coarse`,t(`multigrid`,_+Ve+Be)),this.mod.smoothFine=new f(e,`smooth.fine`,t(`smooth`,_+He+ze)),this.mod.smoothCoarse=new f(e,`smooth.coarse`,t(`smooth`,_+He+Be)),this.mod.pcg=new f(e,`pcg`,t(`pcg`,_+Ue+ze)),this.mod.step=new f(e,`step`,t(`step`,_+We)),this.pl.assemble=this.mod.assemble.pipeline(`main`);for(let e of[`Fine`,`Coarse`])this.pl[`rap${e}`]=this.mod[`mg${e}`].pipeline(`rap`),this.pl[`residual${e}`]=this.mod[`mg${e}`].pipeline(`residual`),this.pl[`smooth${e}`]=this.mod[`smooth${e}`].pipeline(`main`);this.pl.restrict=this.mod.mgCoarse.pipeline(`restrictResidual`),this.pl.pwFine=this.mod.mgFine.pipeline(`prolongWeights`),this.pl.pwCoarse=this.mod.mgCoarse.pipeline(`prolongWeights`),this.pl.prolong=this.mod.mgCoarse.pipeline(`prolongAdd`);for(let e of[`matvecDot`,`dotPartial`,`reduceFinal`,`updateXR`,`updateP`,`clear2`])this.pl[e]=this.mod.pcg.pipeline(e);for(let e of[`predict`,`newtonApply`,`commit`,`slip`])this.pl[e]=this.mod.step.pipeline(e);let n=Ge.replace(`override SHARE_FRACTION: f32 = 0.6;`,`const SHARE_FRACTION: f32 = ${Ze.fraction.toFixed(6)};`).replace(`override SHARE_RUN: u32 = 6u;`,`const SHARE_RUN: u32 = ${Ze.maxRun}u;`);this.mod.yarnField=new f(e,`yarnField`,_+n);for(let e of[`spanStrain`,`sepSnapshot`,`fieldUpdatePick`,`fieldUpdateWarp`,`pullMark`,`pullApply`,`couple`])this.pl[e]=this.mod.yarnField.pipeline(e);this.mod.gate=new f(e,`gate`,it),this.pl.gate=this.mod.gate.pipeline(`gate`),this.mod.energy=new f(e,`energy`,t(`energy`,_+ot+at)),this.pl.energyDelta=this.mod.energy.pipeline(`energyDelta`),this.pl.lineChoose=this.mod.energy.pipeline(`lineChoose`)}createBindGroups(){let e=this.levels[0],t=(e,t,n)=>{this.bg[t]=this.mod[e].bindGroup(t,n)};t(`assemble`,`assemble`,{0:this.simParams,1:this.nodes,2:this.x,3:this.dx,4:this.pred,5:this.segs,6:e.op,7:e.B,8:this.ext}),this.levels.forEach((e,n)=>{let r=n===0?`Fine`:`Coarse`;t(`mg${r}`,`residual${n}`,{0:e.info,2:e.op,3:e.fixed,6:e.X,7:e.B,8:e.R});for(let i=0;i<6;i++)t(`smooth${r}`,`smooth${n}_${i}`,{0:e.info,1:this.slot(e.table.colorStart[i]),2:e.lines,3:e.op,4:e.fixed,5:e.X,6:e.B,7:this.rec});let i=this.levels[n+1];if(!i)return;e.pw=a(this.device,`level${n}.pw`,16*e.N);let o={0:e.info,2:e.op,3:e.fixed,10:e.pw};n===0&&(o[11]=this.segs),t(`mg${r}`,`pw${n}`,o),t(`mg${r}`,`rap${n}`,{0:e.info,1:i.info,2:e.op,3:e.fixed,4:i.op,5:i.fixed,10:e.pw}),t(`mgCoarse`,`restrict${n}`,{0:e.info,1:i.info,3:e.fixed,5:i.fixed,6:e.R,8:i.B,9:i.X,10:e.pw}),t(`mgCoarse`,`prolong${n}`,{0:e.info,1:i.info,3:e.fixed,6:i.X,8:e.X,10:e.pw})});let n=e.info;t(`pcg`,`clear`,{0:n,4:this.delta,5:e.X}),t(`pcg`,`dotRZ`,{0:n,4:e.B,5:e.X,9:this.partial}),t(`pcg`,`matvec`,{0:n,2:e.op,3:e.fixed,4:this.p,5:this.Ap,9:this.partial});for(let e=0;e<128;e++)t(`pcg`,`reduce${e}`,{1:this.slot(0,e,256),9:this.partial,10:this.scal});for(let r=0;r<16;r++)t(`pcg`,`updateXR${r}`,{0:n,1:this.slot(r),4:this.delta,5:this.p,6:e.B,7:this.Ap,8:e.X,10:this.scal}),t(`pcg`,`updateP${r}`,{0:n,1:this.slot(r),4:this.p,5:e.X,10:this.scal});t(`pcg`,`initP`,{0:n,1:this.slot(4294967295),4:this.p,5:e.X,10:this.scal})}createStepBindGroups(){let e={0:this.simParams,2:this.nodes,3:this.x,4:this.v,5:this.dx,6:this.pred,7:this.segs,8:this.tails,9:this.delta,10:this.counters,11:this.contact.meta},t=(e,t)=>{this.bg[e]=this.mod.step.bindGroup(e,t)};for(let n of[`predict`,`commit`])t(n,e);this.bg.yarnField=this.mod.yarnField.bindGroup(`yarnField`,{0:this.simParams,1:this.fieldU,2:this.nodes,3:this.x,4:this.pred,5:this.segs,6:this.tails,7:this.field,8:this.fieldStrength,9:this.counters,10:this.fieldEvents,11:this.pullBits,12:this.acousticSources});for(let e of[`spanStrain`,`fieldUpdate`,`pull`,`couple`])this.bg[e]=this.bg.yarnField;for(let n=0;n<8;n++)t(`newtonApply${n}`,{...e,1:this.slot(n)}),this.bg[`gate${n}`]=this.mod.gate.bindGroup(`gate${n}`,{0:this.slot(n),1:this.counters,2:this.gateArgs,3:this.gateSizes});for(let n=0;n<2;n++)for(let r=0;r<2;r++)t(`slip${n}${r}`,{...e,1:this.slot(n,r)});this.bg.energy=this.mod.energy.bindGroup(`energy`,{0:this.simParams,1:this.nodes,2:this.x,3:this.dx,4:this.pred,5:this.segs,6:this.delta,7:this.ext,8:this.partial4,9:this.counters})}dispatch(e,t,n,r){this.dispatchRaw(e,this.pl[t],this.bg[n],r)}dispatchRaw(e,t,n,r){if(e.setPipeline(t),e.setBindGroup(0,n),this.gatedIteration<0){e.dispatchWorkgroups(r);return}let i=this.sizeIndex.get(r);if(i===void 0)throw Error(`dispatch size ${r} missing from the Newton gate table`);e.dispatchWorkgroupsIndirect(this.gateArgs,12*(this.sizeIndex.size*this.gatedIteration+i))}nodeGroups(e,t=128){return Math.ceil(e/t)}encodeSmooth(e,t,n){let r=this.levels[t];for(let i=0;i<6;i++){let a=n?5-i:i,o=r.table.colorStart[a+1]-r.table.colorStart[a];o>0&&this.dispatch(e,t===0?`smoothFine`:`smoothCoarse`,`smooth${t}_${a}`,o)}}encodeVCycle(e,t=0){if(t===this.levels.length-1){for(let n=0;n<this.params.coarseSweeps;n++)this.encodeSmooth(e,t,(n&1)==1);return}let n=this.levels[t],r=this.levels[t+1];this.encodeSmooth(e,t,!1),this.dispatch(e,t===0?`residualFine`:`residualCoarse`,`residual${t}`,this.nodeGroups(n.N)),this.dispatch(e,`restrict`,`restrict${t}`,this.nodeGroups(r.N)),this.encodeVCycle(e,t+1),this.dispatch(e,`prolong`,`prolong${t}`,this.nodeGroups(n.N)),this.encodeSmooth(e,t,!0)}encodeKernel(e,t,n=0){t===`assemble`&&this.dispatch(e,`assemble`,`assemble`,this.nodeGroups(this.N)),t===`rap`&&this.dispatch(e,n===0?`rapFine`:`rapCoarse`,`rap${n}`,this.nodeGroups(this.levels[n+1].N,64)),t===`residual`&&this.dispatch(e,n===0?`residualFine`:`residualCoarse`,`residual${n}`,this.nodeGroups(this.levels[n].N)),t===`matvec`&&this.dispatch(e,`matvecDot`,`matvec`,256)}encodeAssemble(e,t=!0){if(this.dispatch(e,`assemble`,`assemble`,this.nodeGroups(this.N)),t)for(let t=0;t+1<this.levels.length;t++)this.dispatch(e,t===0?`pwFine`:`pwCoarse`,`pw${t}`,this.nodeGroups(this.levels[t].N)),this.dispatch(e,t===0?`rapFine`:`rapCoarse`,`rap${t}`,this.nodeGroups(this.levels[t+1].N,64))}encodePCG(e){let t=this.params.pcgIterations,n=this.nodeGroups(this.N,256);this.dispatch(e,`clear2`,`clear`,n),this.encodeVCycle(e,0),this.dispatch(e,`updateP`,`initP`,n),this.dispatch(e,`dotPartial`,`dotRZ`,256),this.dispatch(e,`reduceFinal`,`reduce0`,1);for(let r=0;r<t&&(this.dispatch(e,`matvecDot`,`matvec`,256),this.dispatch(e,`reduceFinal`,`reduce${2*r+1}`,1),this.dispatch(e,`updateXR`,`updateXR${r}`,n),r+1!==t);r++)this.encodeVCycle(e,0),this.dispatch(e,`dotPartial`,`dotRZ`,256),this.dispatch(e,`reduceFinal`,`reduce${2*r+2}`,1),this.dispatch(e,`updateP`,`updateP${r}`,n)}encodeLineSearch(e){this.dispatch(e,`energyDelta`,`energy`,256),this.dispatch(e,`lineChoose`,`energy`,1)}encodeNewtonIteration(e,t,n=!1){this.contactEnabled&&this.contact.encodeTerms(e),n||this.preAssemble?.((t,n)=>this.dispatchRaw(e,t,n,32)),this.encodeAssemble(e,t===0),this.encodePCG(e),this.encodeLineSearch(e),this.dispatch(e,`newtonApply`,`newtonApply${t}`,this.nodeGroups(this.N))}encodePredict(e){this.dispatch(e,`predict`,`predict`,this.nodeGroups(this.N))}encodeDamage(e){this.dispatch(e,`spanStrain`,`spanStrain`,this.nodeGroups(this.N));let t=Math.ceil(Math.ceil(this.scene.fieldDamage.length/2/16)/128);this.dispatch(e,`sepSnapshot`,`pull`,t),this.dispatch(e,`fieldUpdatePick`,`fieldUpdate`,Math.ceil(16*this.N/128)),this.dispatch(e,`fieldUpdateWarp`,`fieldUpdate`,Math.ceil(16*this.N/128)),this.dispatch(e,`pullMark`,`pull`,t),this.dispatch(e,`pullApply`,`pull`,t),this.dispatch(e,`couple`,`couple`,this.nodeGroups(2*this.N))}encodeFinalize(e){this.dispatch(e,`commit`,`commit`,this.nodeGroups(this.N)),this.encodeDamage(e);for(let t=0;t<2;t++)for(let n=0;n<2;n++)this.dispatch(e,`slip`,`slip${t}${n}`,this.nodeGroups(this.N))}encodeSubstep(e){this.contactEnabled&&this.contact.encodeClear(e),e.clearBuffer(this.counters,16,32);let t=e.beginComputePass({label:`substep`});this.encodePredict(t),this.preSubstep?.(t),this.contactEnabled&&this.contact.encodeDetect(t);let{newtonIterations:n,newtonMax:r}=this.params;for(let e=0;e<r;e++){e>=n&&(this.dispatch(t,`gate`,`gate${e-1}`,Math.ceil(this.sizeIndex.size/64)),this.gatedIteration=e);try{this.encodeNewtonIteration(t,e)}finally{this.gatedIteration=-1}}this.encodeFinalize(t),t.end()}encodeContactRefresh(e){if(!this.contactEnabled)return;this.contact.encodeClear(e),e.clearBuffer(this.dx);let t=e.beginComputePass({label:`contactRefresh`});this.contact.encodeDetect(t),t.end()}setHistoryEnabled(e){this.device.queue.writeBuffer(this.simParams,24,new Uint32Array([+!!e]))}setTimestep(e){this.params.h=e,this.device.queue.writeBuffer(this.simParams,0,new Float32Array([e]))}resetState(){let e=this.N,t=new Float32Array(4*e);for(let n=0;n<e;n++)for(let e=0;e<3;e++)t[4*n+e]=this.scene.position[3*n+e];this.setState(t),this.setSegments(this.scene,this.scene.tails),this.setField(this.scene.fieldDamage),this.device.queue.writeBuffer(this.ext,0,new Float32Array(12*e))}setSegments(e,t){this.device.queue.writeBuffer(this.segs,0,this.segData(e)),this.device.queue.writeBuffer(this.tails,0,Float32Array.from(t))}setField(e){this.device.queue.writeBuffer(this.field,0,lt(e,this.scene.fieldArea)),this.device.queue.writeBuffer(this.fieldEvents,0,new Uint32Array([1]))}setState(e,t){this.device.queue.writeBuffer(this.x,0,e),t?this.device.queue.writeBuffer(this.v,0,t):this.device.queue.writeBuffer(this.v,0,new Float32Array(4*this.N))}};function ft(e){return e>>>=0,e^=e>>>16,e=Math.imul(e,2146121005)>>>0,e^=e>>>15,e=Math.imul(e,2221713035)>>>0,e^=e>>>16,e>>>0}function pt(e,t,n){return ft(e^ft(t^ft(n)))}function q(e,t=0,n=0){return pt(e,t,n)/4294967296}function mt(e){return e*e*e*(e*(e*6-15)+10)}function ht(e,t,n,r,i){let a=pt(e,t,n)/4294967296*Math.PI*2;return Math.cos(a)*r+Math.sin(a)*i}function gt(e,t,n){let r=Math.floor(t),i=Math.floor(n),a=t-r,o=n-i,s=mt(a),c=mt(o),l=ht(e,r,i,a,o),u=ht(e,r+1,i,a-1,o),d=ht(e,r,i+1,a,o-1),f=ht(e,r+1,i+1,a-1,o-1),p=l+(u-l)*s;return p+(d+(f-d)*s-p)*c}function J(e,t,n,r,i=2.03,a=.5){let o=0,s=1,c=0,l=t,u=n;for(let t=0;t<r;t++)o+=s*gt(e+t*1013,l,u),c+=s,s*=a,l*=i,u*=i;return o/c*1.6}function _t(e,t){return gt(e,t,.5+e%7*.13)}function vt(e,t,n){let r=Math.min(1,Math.max(0,(n-e)/(t-e)));return r*r*(3-2*r)}function yt(e){let t=2166136261,n=e=>t=Math.imul(t^e,16777619)>>>0;n(10);for(let t of e.layers){let e=JSON.stringify(t.material);for(let t=0;t<e.length;t++)n(e.charCodeAt(t))}for(let n=0;n<e.fieldDamage.length;n+=64)t=Math.imul(t^e.fieldDamage[n]^e.fieldArea[n]<<16^n<<8,16777619)>>>0;let r=new Float32Array(e.position),i=new Uint32Array(r.buffer);for(let e=0;e<i.length;e++)t=Math.imul(t^i[e],16777619)>>>0;for(let n=0;n<e.segFlags.length;n++)t=Math.imul(t^e.segFlags[n],16777619)>>>0;return t>>>0}function bt(e,t,n){let r=Math.floor(t),i=Math.floor(n),a=1e9,o=1e9;for(let s=-1;s<=1;s++)for(let c=-1;c<=1;c++){let l=r+c,u=i+s,d=l+.15+.7*q(e,l,u),f=u+.15+.7*q(e+17,l,u),p=Math.hypot(d-t,f-n);p<a?(o=a,a=p):p<o&&(o=p)}return[a,o]}function xt(e,t,n,r){if(e.amount<=0)return[0,0];let i=Math.hypot(e.axis[0],e.axis[1])||1,a=e.axis[0]/i,o=e.axis[1]/i,s=n-e.center[0],c=r-e.center[1],l=(s*a+c*o)/e.radii[0],u=(-s*o+c*a)/e.radii[1],d=e.featureScale,f=.32*J(t+3,n/(1.4*d),r/(1.4*d),4),p=1-vt(.4,1.1,Math.hypot(l,u)+f),m=1;if(e.cellSize>0){let i=n+.4*d*J(t+11,n/d,r/d,3),a=r+.4*d*J(t+12,n/d,r/d,3),[o,s]=bt(t+5,i/e.cellSize,a/e.cellSize);m=vt(.03,.3,s-o)**.7}p*=(.82+.18*J(t+7,n/(.3*d),r/(.3*d),3))*e.amount;let h=e=>Math.min(1,Math.max(0,e));return[h(p*(.12+.88*m)),h(p**2.2*(.35+.65*m))]}function St(e,t,n){let r=e.bundle??[1,1],i=h(e.material,r[0],r[1]),a=Math.floor(e.sizeU/i.pitchU)+1,o=Math.floor(e.sizeV/i.pitchV)+1,s=Math.cos(e.angle),c=Math.sin(e.angle),l=1-e.compressU,u=e.shear,d=1-e.compressV,f=[s*l,s*u-c*d,c*l,c*u+s*d],p=[(a-1)*i.pitchU/2,(o-1)*i.pitchV/2],m=[0,0,e.z];return{info:{index:t,material:i,weave:e.material,bundle:r,nx:a,ny:o,nodeOffset:n,nodeCount:a*o,mapA:f,mapOrigin:m,restCenter:p}}}function Ct(e){let t=[],n=0;for(let r=0;r<e.length;r++){let{info:i}=St(e[r],r,n);t.push(i),n+=i.nodeCount}let r=n,i=Ke(t),a={version:1,layers:t,nodeCount:r,restUV:new Float64Array(2*r),position:new Float64Array(3*r),mass:new Float64Array(r),pinned:new Uint8Array(r),wear:new Float32Array(r),structuralWear:new Float32Array(r),restLength:new Float64Array(2*r),softening:new Float64Array(2*r),segFlags:new Uint16Array(2*r),intact:new Float64Array(2*r),cutMask:new Uint32Array(2*r),failSite:new Float32Array(2*r),field:i.layers,fieldStrength:new Float32Array(2*i.count),fieldDamage:new Uint8Array(2*i.count),fieldArea:new Uint8Array(2*i.count).fill(255),crossingNormal0:new Float64Array(r),tails:new Float64Array(4*r)};for(let n=0;n<e.length;n++)Tt(a,e[n],t[n]),Et(a,e[n],t[n],i.layers[n]);let o=e=>(a.segFlags[e]&3)==1,s=Uint16Array.from(a.segFlags);$e(t,i.layers,a.fieldArea,a.fieldDamage,a,o,2);for(let e=0;e<a.segFlags.length;e++)a.segFlags[e]&2&&!(s[e]&2)&&(a.segFlags[e]|=4);return a}function wt(e,t,n,r){let i=Math.cos(e.angle),a=Math.sin(e.angle),o=n-t.restCenter[0],s=r-t.restCenter[1];return[i*o-a*s,a*o+i*s]}function Tt(e,t,n){let r=n.material,{nx:i,ny:a,nodeOffset:o,mapA:s,mapOrigin:c,restCenter:l}=n,u=g(r),d=t.seed,f=r.yarns[0],p=r.yarns[1],m=t.collarRows;for(let h=0;h<a;h++)for(let g=0;g<i;g++){let _=o+h*i+g,v=g*r.pitchU,y=h*r.pitchV;e.restUV[2*_]=v,e.restUV[2*_+1]=y;let b=v-l[0],x=y-l[1],S=c[0]+s[0]*b+s[1]*x,C=c[1]+s[2]*b+s[3]*x,w=g<m||h<m||g>=i-m||h>=a-m,T=1-vt(.16,.24,Math.hypot(S,C)),E=w?0:t.perturbation*T*J(101,S/.04,C/.04,3);e.position[3*_]=S,e.position[3*_+1]=C,e.position[3*_+2]=c[2]+E,e.mass[_]=u,e.pinned[_]=+!!w;let[D,O]=wt(t,n,v,y),[k,A]=xt(t.wear,d,D,O);e.wear[_]=A,e.structuralWear[_]=k,e.crossingNormal0[_]=r.crossingNormal0*(1-.7*k);for(let t=0;t<2;t++){let n=2*_+t;if(!(t===0?g<i-1:h<a-1))continue;let o=t===0?f:p;e.segFlags[n]=1,e.restLength[n]=t===0?r.pitchU:r.pitchV,e.intact[n]=1,e.softening[n]=o.softeningOpening,e.failSite[n]=.5}}}const Y=.001;function Et(e,t,n,r){if(r.bu>32||r.bv>32)throw Error(`bundle too large for the cut masks`);let i=n.weave,a=t.seed,o=i.pitchU,s=i.pitchV,c=-r.bu*o,l=-r.bv*s,u=Math.ceil((r.K+2*r.bu)*o/Y)+2,d=Math.ceil((r.M+2*r.bv)*s/Y)+2,f=new Float32Array(u*d),p=new Float32Array(u*d),m=new Float32Array(u*d);for(let e=0;e<d;e++)for(let r=0;r<u;r++){let[i,o]=wt(t,n,c+r*Y,l+e*Y);f[e*u+r]=xt(t.wear,a,i,o)[0],p[e*u+r]=J(a+503,i/.011,o/.011,3),m[e*u+r]=J(a+991,i/.004,o/.004,2)}let h=(e,t,n)=>{let r=Math.min(u-1.001,Math.max(0,(t-c)/Y)),i=Math.min(d-1.001,Math.max(0,(n-l)/Y)),a=Math.floor(r),o=Math.floor(i),s=r-a,f=i-o,p=e[o*u+a]+(e[o*u+a+1]-e[o*u+a])*s;return p+(e[(o+1)*u+a]+(e[(o+1)*u+a+1]-e[(o+1)*u+a])*s-p)*f},g=t.wear.defectThreshold;for(let n=0;n<r.M;n++){let c=(n-(r.bv-1)/2)*s;for(let s=0;s<r.K;s++){let l=(s-(r.bu-1)/2)*o,u=r.offset+n*r.K+s,d=h(f,l,c),_=h(p,l,c);for(let r=0;r<2;r++){let o=t.wearStrengthLoss[r],f=r===0?d**1.3:d**1.25,p=r===1?s:n,m=r===1?c:l,h=1+.25*_t(a+4099+13*p+7*r,m/.0025),g=(q(a+503,u,r)+q(a+617,u,r)-1)*2.45,v=Math.exp((.2+.12*d)*_+(.06+.22*d)*g),y=Math.max(.02,1-o*f);e.fieldArea[2*u+r]=qe(y),e.fieldStrength[2*u+r]=i.yarns[r].strength*Math.max(.005,y*v*h)}d>g+.04*h(m,l,c)+.012*(q(a+990,s)-.5)&&q(a+991,s,n)<t.wear.defectDensity&&(e.fieldDamage[2*u+1]=255);let v=i.twillRepeat,y=Math.floor((n-s%v+4*v)/v),b=.02*vt(t.wear.sparseFrom,g,d)**2,x=((n-s)%v+v)%v<i.twillWarpOver;b>0&&x&&q(a+997,s,y)<b&&(e.fieldDamage[2*u+1]=255)}}}function Dt(){return[{material:m,bundle:[9,6],sizeU:.62,sizeV:.4,z:0,angle:.06,compressU:.025,compressV:-.002,shear:.06,collarRows:2,wear:{center:[.01,-.006],axis:[1,-1.15],radii:[.2,.14],amount:1,cellSize:.075,featureScale:.05,defectThreshold:.89,defectDensity:1,sparseFrom:.6},wearStrengthLoss:[.45,.9],seed:1001,perturbation:.0025}]}function Ot(e,t){if(t.byteLength!==16+16*e.N)return!1;let n=new Uint32Array(t,0,4);return n[0]!==1346458180||n[1]!==1||n[2]!==e.N||n[3]!==yt(e.scene)?!1:(e.device.queue.writeBuffer(e.x,0,new Float32Array(t,16)),!0)}async function kt(e,t){let n=t.params,r={newtonIterations:n.newtonIterations,newtonMax:n.newtonMax,pcgIterations:n.pcgIterations};n.newtonIterations=5,n.newtonMax=5,n.pcgIterations=2,t.setHistoryEnabled(!1);try{for(let n=0;n<420;n++){let r=e.createCommandEncoder({label:`settle`});if(t.encodeSubstep(r),n%10==9&&n<360&&r.clearBuffer(t.v),e.queue.submit([r.finish()]),n%2==1){let t=performance.now();await e.queue.onSubmittedWorkDone(),await new Promise(e=>setTimeout(e,Math.min(30,performance.now()-t)))}}}finally{Object.assign(n,r),t.setHistoryEnabled(!0)}let i=e.createCommandEncoder({label:`settle.end`});i.clearBuffer(t.v),i.clearBuffer(t.counters),e.queue.submit([i.finish()]),await e.queue.onSubmittedWorkDone()}var At=`// Dynamic node state (x.w): 0 = cloth, 1 = ballistic debris (part of a piece no longer connected to
+`;const vt={h:1/120,gravity:[0,0,-9.81],newtonIterations:2,newtonMax:2,newtonTolerance:1e-5,historyTolerance:1,pcgIterations:2,coarseSweeps:2,maxCoarsestNodes:400,selfContact:!0},yt={newtonIterations:4,duration:.1};function bt(e,t){let n=/* @__PURE__ */ new ArrayBuffer(368),r=new Float32Array(n),i=new Uint32Array(n);return r[0]=t.h,r[1]=t.gravity[0],r[2]=t.gravity[1],r[3]=t.gravity[2],i[4]=e.nodeCount,i[5]=e.layers.length,i[6]=1,r[7]=t.historyTolerance,e.layers.forEach((e,t)=>{let n=(32+t*112)/4;i[n]=e.nodeOffset,i[n+1]=e.nx,i[n+2]=e.ny;for(let t=0;t<2;t++){let i=e.material.yarns[t],a=n+4+t*8;r[a]=i.eaLow,r[a+1]=i.eaHigh,r[a+2]=i.crimpStrain,r[a+3]=i.eaCompress,r[a+4]=i.axialViscosity,r[a+5]=i.bendRigidity,r[a+6]=i.bendViscosity,r[a+7]=i.yarnsPerSpan??1}let a=e.material;r[n+20]=a.shearStiffness,r[n+21]=a.crossingFriction,r[n+22]=a.crossingWrap,r[n+23]=a.pitchU,r[n+24]=a.pitchV,r[n+25]=a.airDrag,r[n+26]=a.crossingNormal0}),n}function xt(e,t){let n=new Uint32Array(e.length/2);for(let r=0;r<n.length;r++)n[r]=(e[2*r]|e[2*r+1]<<8|t[2*r]<<16|t[2*r+1]<<24)>>>0;return n}function St(e){let t=/* @__PURE__ */ new Uint32Array(16);return t[0]=We(e),t[1]=e.length,e.forEach((e,n)=>{t[4+4*n]=e.offset,t[5+4*n]=e.nx,t[6+4*n]=e.ny}),t}var Ct=class{device;scene;params;N;simParams;nodes;x;v;dx;pred;segs;tails;ext;field;fieldStrength;fieldU;fieldEvents;pullBits;counters;acousticSources;contact;contactEnabled;gateArgs;gateSizes;sizeIndex=/* @__PURE__ */ new Map;gatedIteration=-1;levels;delta;p;Ap;rec;partial;partial4;scal;slots;slotCount=0;slotData;pl={};bg={};mod={};preSubstep=null;preAssemble=null;constructor(e,t,n=vt){this.device=e,this.scene=t,this.params={...n};let r=t.nodeCount;this.N=r,this.simParams=o(e,`simParams`,new Uint8Array(bt(t,n)),i);let s=/* @__PURE__ */ new ArrayBuffer(16*r),c=new Uint32Array(s),l=new Float32Array(s);for(let e of t.layers)for(let n=0;n<e.ny;n++)for(let r=0;r<e.nx;r++){let i=e.nodeOffset+n*e.nx+r;c[4*i]=r|n<<12|e.index<<24,c[4*i+1]=t.pinned[i],l[4*i+2]=t.mass[i],l[4*i+3]=t.crossingNormal0[i]}if(t.layers.some(e=>e.nx>=4096||e.ny>=4096))throw Error(`lattice too large for ijl packing`);this.nodes=o(e,`nodes`,new Uint8Array(s));let u=new Float32Array(4*r);for(let e=0;e<r;e++)for(let n=0;n<3;n++)u[4*e+n]=t.position[3*e+n];if(this.x=o(e,`x`,u),this.v=a(e,`v`,16*r),this.dx=a(e,`dx`,16*r),this.pred=a(e,`pred`,16*r),this.segs=o(e,`segs`,new Uint8Array(this.segData(t))),t.layers.some(e=>e.bundle[0]>16||e.bundle[1]>16))throw Error(`bundles of more than 16 yarns are not supported by the GPU field update`);this.field=o(e,`field`,xt(t.fieldDamage,t.fieldArea)),this.fieldStrength=o(e,`fieldStrength`,t.fieldStrength);let d=/* @__PURE__ */ new Uint32Array(12);t.field.forEach((e,n)=>d.set([e.offset,e.K,e.M,lt(t.layers[n].weave,0)|lt(t.layers[n].weave,1)<<16],4*n)),this.fieldU=o(e,`fieldU`,d,i),this.fieldEvents=o(e,`fieldEvents`,new Uint32Array([1,0,0,0])),this.pullBits=a(e,`pullBits`,4*Math.ceil(t.fieldDamage.length/2/16)),this.tails=o(e,`tails`,Float32Array.from(t.tails)),this.ext=a(e,`ext`,48*r),this.counters=a(e,`counters`,160),this.acousticSources=a(e,`acousticSources`,64,i),this.contactEnabled=t.layers.length>1||this.params.selfContact;let f=t.layers.map(e=>({nx:e.nx,ny:e.ny,offset:e.nodeOffset}));if(this.levels=Ue(f,this.params.maxCoarsestNodes).map((n,s)=>{let c=We(n),l=Ge(n,3);if(l.maxLength>384)throw Error(`yarn line of ${l.maxLength} exceeds 384`);let u=new Uint32Array(c);if(s===0)for(let e=0;e<r;e++)u[e]=t.pinned[e];return{layers:n,N:c,info:o(e,`level${s}.info`,St(n),i),op:a(e,`level${s}.op`,c*(s===0?72:200)*4),fixed:o(e,`level${s}.fixed`,u),X:a(e,`level${s}.X`,16*c),B:a(e,`level${s}.B`,16*c),R:a(e,`level${s}.R`,16*c),lines:o(e,`level${s}.lines`,l.lines),table:l,pw:null}}),this.delta=a(e,`pcg.delta`,16*r),this.p=a(e,`pcg.p`,16*r),this.Ap=a(e,`pcg.Ap`,16*r),this.rec=a(e,`smooth.scratch`,160*r),this.partial=a(e,`pcg.partial`,1024),this.partial4=a(e,`lineSearch.partial`,8192),this.scal=a(e,`pcg.scal`,512),this.slotData=/* @__PURE__ */ new Uint32Array(16384),this.slots=a(e,`slots`,this.slotData.byteLength,i),n.newtonMax>8||n.newtonIterations<1||n.newtonIterations>n.newtonMax)throw Error(`invalid Newton iteration bounds`);if(this.contact=t.layers.length>1?new qe(this,t):new x(this),!this.contactEnabled){let t=new Float32Array(8*r);for(let e=0;e<2*r;e++)t[4*e+3]=1e9;e.queue.writeBuffer(this.contact.meta,0,t)}let p=[];this.createPipelines(),this.createBindGroups(),this.encodeNewtonIteration({setPipeline(){},setBindGroup(){},dispatchWorkgroups(e){p.includes(e)||p.push(e)},end(){}},0,!0),p.includes(32)||p.push(32),p.forEach((e,t)=>this.sizeIndex.set(e,t)),this.gateSizes=o(e,`newton.gateSizes`,new Uint32Array([p.length,new Uint32Array(new Float32Array([n.newtonTolerance]).buffer)[0],...p])),this.gateArgs=a(e,`newton.gateArgs`,12*p.length*9,GPUBufferUsage.STORAGE|GPUBufferUsage.INDIRECT|GPUBufferUsage.COPY_DST),this.createStepBindGroups(),e.queue.writeBuffer(this.slots,0,this.slotData)}segData(e){let t=this.scene,n=/* @__PURE__ */ new ArrayBuffer(64*t.nodeCount),r=new Float32Array(n),i=new Uint32Array(n);for(let n=0;n<2*t.nodeCount;n++)r[8*n]=e.restLength[n],r[8*n+1]=e.intact[n],r[8*n+2]=t.softening[n],i[8*n+3]=e.cutMask[n],i[8*n+5]=e.segFlags[n],r[8*n+6]=e.failSite[n];return n}slot(e,t=0,n=0,r=0){let i=this.slotCount++;if(i>=256)throw Error(`out of uniform slots`);let a=i*256/4;return this.slotData[a]=e>>>0,this.slotData[a+1]=t>>>0,this.slotData[a+2]=n>>>0,this.slotData[a+3]=r>>>0,{buffer:this.slots,offset:i*256,size:16}}createPipelines(){let e=this.device,t=this.params.patch??((e,t)=>t);this.mod.assemble=new f(e,`assemble`,t(`assemble`,_+_t+Xe));let n=Ze.replace(`const LINK_MIN_INTACT: f32 = 0.02;`,`const LINK_MIN_INTACT: f32 = 0.02;`);this.mod.mgFine=new f(e,`multigrid.fine`,t(`multigrid`,_+n+Je)),this.mod.mgCoarse=new f(e,`multigrid.coarse`,t(`multigrid`,_+n+Ye)),this.mod.smoothFine=new f(e,`smooth.fine`,t(`smooth`,_+Qe+Je)),this.mod.smoothCoarse=new f(e,`smooth.coarse`,t(`smooth`,_+Qe+Ye)),this.mod.pcg=new f(e,`pcg`,t(`pcg`,_+$e+Je)),this.mod.step=new f(e,`step`,t(`step`,_+et)),this.pl.assemble=this.mod.assemble.pipeline(`main`);for(let e of[`Fine`,`Coarse`])this.pl[`rap${e}`]=this.mod[`mg${e}`].pipeline(`rap`),this.pl[`residual${e}`]=this.mod[`mg${e}`].pipeline(`residual`),this.pl[`smooth${e}`]=this.mod[`smooth${e}`].pipeline(`main`);this.pl.restrict=this.mod.mgCoarse.pipeline(`restrictResidual`),this.pl.pwFine=this.mod.mgFine.pipeline(`prolongWeights`),this.pl.pwCoarse=this.mod.mgCoarse.pipeline(`prolongWeights`),this.pl.prolong=this.mod.mgCoarse.pipeline(`prolongAdd`);for(let e of[`matvecDot`,`dotPartial`,`reduceFinal`,`updateXR`,`updateP`,`clear2`])this.pl[e]=this.mod.pcg.pipeline(e);for(let e of[`predict`,`newtonApply`,`projectStart`,`commit`,`slip`])this.pl[e]=this.mod.step.pipeline(e);let r=tt.replace(`override SHARE_FRACTION: f32 = 0.6;`,`const SHARE_FRACTION: f32 = ${ct.fraction.toFixed(6)};`).replace(`override SHARE_RUN: u32 = 6u;`,`const SHARE_RUN: u32 = ${ct.maxRun}u;`);this.mod.yarnField=new f(e,`yarnField`,_+r);for(let e of[`spanStrain`,`sepSnapshot`,`fieldUpdatePick`,`fieldUpdateWarp`,`pullMark`,`pullApply`,`couple`])this.pl[e]=this.mod.yarnField.pipeline(e);this.mod.gate=new f(e,`gate`,ht),this.pl.gate=this.mod.gate.pipeline(`gate`),this.mod.energy=new f(e,`energy`,t(`energy`,_+_t+gt)),this.pl.energyDelta=this.mod.energy.pipeline(`energyDelta`),this.pl.lineChoose=this.mod.energy.pipeline(`lineChoose`)}createBindGroups(){let e=this.levels[0],t=(e,t,n)=>{this.bg[t]=this.mod[e].bindGroup(t,n)};t(`assemble`,`assemble`,{0:this.simParams,1:this.nodes,2:this.x,3:this.dx,4:this.pred,5:this.segs,6:e.op,7:e.B,8:this.ext}),this.levels.forEach((e,n)=>{let r=n===0?`Fine`:`Coarse`;t(`mg${r}`,`residual${n}`,{0:e.info,2:e.op,3:e.fixed,6:e.X,7:e.B,8:e.R});for(let i=0;i<6;i++)t(`smooth${r}`,`smooth${n}_${i}`,{0:e.info,1:this.slot(e.table.colorStart[i]),2:e.lines,3:e.op,4:e.fixed,5:e.X,6:e.B,7:this.rec});let i=this.levels[n+1];if(!i)return;e.pw=a(this.device,`level${n}.pw`,16*e.N);let o={0:e.info,2:e.op,3:e.fixed,10:e.pw};n===0&&(o[11]=this.segs),t(`mg${r}`,`pw${n}`,o),t(`mg${r}`,`rap${n}`,{0:e.info,1:i.info,2:e.op,3:e.fixed,4:i.op,5:i.fixed,10:e.pw}),t(`mgCoarse`,`restrict${n}`,{0:e.info,1:i.info,3:e.fixed,5:i.fixed,6:e.R,8:i.B,9:i.X,10:e.pw}),t(`mgCoarse`,`prolong${n}`,{0:e.info,1:i.info,3:e.fixed,6:i.X,8:e.X,10:e.pw})});let n=e.info;t(`pcg`,`clear`,{0:n,4:this.delta,5:e.X}),t(`pcg`,`dotRZ`,{0:n,4:e.B,5:e.X,9:this.partial}),t(`pcg`,`matvec`,{0:n,2:e.op,3:e.fixed,4:this.p,5:this.Ap,9:this.partial});for(let e=0;e<128;e++)t(`pcg`,`reduce${e}`,{1:this.slot(0,e,256),9:this.partial,10:this.scal});for(let r=0;r<16;r++)t(`pcg`,`updateXR${r}`,{0:n,1:this.slot(r),4:this.delta,5:this.p,6:e.B,7:this.Ap,8:e.X,10:this.scal}),t(`pcg`,`updateP${r}`,{0:n,1:this.slot(r),4:this.p,5:e.X,10:this.scal});t(`pcg`,`initP`,{0:n,1:this.slot(4294967295),4:this.p,5:e.X,10:this.scal})}createStepBindGroups(){let e={0:this.simParams,2:this.nodes,3:this.x,4:this.v,5:this.dx,6:this.pred,7:this.segs,8:this.tails,9:this.delta,10:this.counters,11:this.contact.meta},t=(e,t)=>{this.bg[e]=this.mod.step.bindGroup(e,t)};for(let n of[`predict`,`commit`,`project`])t(n,e);this.bg.yarnField=this.mod.yarnField.bindGroup(`yarnField`,{0:this.simParams,1:this.fieldU,2:this.nodes,3:this.x,4:this.pred,5:this.segs,6:this.tails,7:this.field,8:this.fieldStrength,9:this.counters,10:this.fieldEvents,11:this.pullBits,12:this.acousticSources});for(let e of[`spanStrain`,`fieldUpdate`,`pull`,`couple`])this.bg[e]=this.bg.yarnField;for(let n=0;n<8;n++)t(`newtonApply${n}`,{...e,1:this.slot(n)}),this.bg[`gate${n}`]=this.mod.gate.bindGroup(`gate${n}`,{0:this.slot(n),1:this.counters,2:this.gateArgs,3:this.gateSizes});for(let n=0;n<2;n++)for(let r=0;r<2;r++)t(`slip${n}${r}`,{...e,1:this.slot(n,r)});this.bg.energy=this.mod.energy.bindGroup(`energy`,{0:this.simParams,1:this.nodes,2:this.x,3:this.dx,4:this.pred,5:this.segs,6:this.delta,7:this.ext,8:this.partial4,9:this.counters})}dispatch(e,t,n,r){this.dispatchRaw(e,this.pl[t],this.bg[n],r)}dispatchRaw(e,t,n,r){if(e.setPipeline(t),e.setBindGroup(0,n),this.gatedIteration<0){e.dispatchWorkgroups(r);return}let i=this.sizeIndex.get(r);if(i===void 0)throw Error(`dispatch size ${r} missing from the Newton gate table`);e.dispatchWorkgroupsIndirect(this.gateArgs,12*(this.sizeIndex.size*this.gatedIteration+i))}nodeGroups(e,t=128){return Math.ceil(e/t)}encodeSmooth(e,t,n){let r=this.levels[t];for(let i=0;i<6;i++){let a=n?5-i:i,o=r.table.colorStart[a+1]-r.table.colorStart[a];o>0&&this.dispatch(e,t===0?`smoothFine`:`smoothCoarse`,`smooth${t}_${a}`,o)}}encodeVCycle(e,t=0){if(t===this.levels.length-1){for(let n=0;n<this.params.coarseSweeps;n++)this.encodeSmooth(e,t,(n&1)==1);return}let n=this.levels[t],r=this.levels[t+1];this.encodeSmooth(e,t,!1),this.dispatch(e,t===0?`residualFine`:`residualCoarse`,`residual${t}`,this.nodeGroups(n.N)),this.dispatch(e,`restrict`,`restrict${t}`,this.nodeGroups(r.N)),this.encodeVCycle(e,t+1),this.dispatch(e,`prolong`,`prolong${t}`,this.nodeGroups(n.N)),this.encodeSmooth(e,t,!0)}encodeKernel(e,t,n=0){t===`assemble`&&this.dispatch(e,`assemble`,`assemble`,this.nodeGroups(this.N)),t===`rap`&&this.dispatch(e,n===0?`rapFine`:`rapCoarse`,`rap${n}`,this.nodeGroups(this.levels[n+1].N,64)),t===`residual`&&this.dispatch(e,n===0?`residualFine`:`residualCoarse`,`residual${n}`,this.nodeGroups(this.levels[n].N)),t===`matvec`&&this.dispatch(e,`matvecDot`,`matvec`,256)}encodeAssemble(e,t=!0){if(this.dispatch(e,`assemble`,`assemble`,this.nodeGroups(this.N)),t)for(let t=0;t+1<this.levels.length;t++)this.dispatch(e,t===0?`pwFine`:`pwCoarse`,`pw${t}`,this.nodeGroups(this.levels[t].N)),this.dispatch(e,t===0?`rapFine`:`rapCoarse`,`rap${t}`,this.nodeGroups(this.levels[t+1].N,64))}encodePCG(e){let t=this.params.pcgIterations,n=this.nodeGroups(this.N,256);this.dispatch(e,`clear2`,`clear`,n),this.encodeVCycle(e,0),this.dispatch(e,`updateP`,`initP`,n),this.dispatch(e,`dotPartial`,`dotRZ`,256),this.dispatch(e,`reduceFinal`,`reduce0`,1);for(let r=0;r<t&&(this.dispatch(e,`matvecDot`,`matvec`,256),this.dispatch(e,`reduceFinal`,`reduce${2*r+1}`,1),this.dispatch(e,`updateXR`,`updateXR${r}`,n),r+1!==t);r++)this.encodeVCycle(e,0),this.dispatch(e,`dotPartial`,`dotRZ`,256),this.dispatch(e,`reduceFinal`,`reduce${2*r+2}`,1),this.dispatch(e,`updateP`,`updateP${r}`,n)}encodeLineSearch(e){this.dispatch(e,`energyDelta`,`energy`,256),this.dispatch(e,`lineChoose`,`energy`,1)}encodeNewtonIteration(e,t,n=!1){this.contactEnabled&&this.contact.encodeTerms(e),n||this.preAssemble?.((t,n)=>this.dispatchRaw(e,t,n,32)),this.encodeAssemble(e,t===0),this.encodePCG(e),this.encodeLineSearch(e),this.dispatch(e,`newtonApply`,`newtonApply${t}`,this.nodeGroups(this.N))}encodePredict(e){this.dispatch(e,`predict`,`predict`,this.nodeGroups(this.N))}encodeDamage(e){this.dispatch(e,`spanStrain`,`spanStrain`,this.nodeGroups(this.N));let t=Math.ceil(Math.ceil(this.scene.fieldDamage.length/2/16)/128);this.dispatch(e,`sepSnapshot`,`pull`,t),this.dispatch(e,`fieldUpdatePick`,`fieldUpdate`,Math.ceil(16*this.N/128)),this.dispatch(e,`fieldUpdateWarp`,`fieldUpdate`,Math.ceil(16*this.N/128)),this.dispatch(e,`pullMark`,`pull`,t),this.dispatch(e,`pullApply`,`pull`,t),this.dispatch(e,`couple`,`couple`,this.nodeGroups(2*this.N))}encodeFinalize(e){this.dispatch(e,`commit`,`commit`,this.nodeGroups(this.N)),this.encodeDamage(e);for(let t=0;t<2;t++)for(let n=0;n<2;n++)this.dispatch(e,`slip`,`slip${t}${n}`,this.nodeGroups(this.N))}encodeSubstep(e,t=0,n=0){this.contactEnabled&&this.contact.encodeClear(e),e.clearBuffer(this.counters,16,32);let r=e.beginComputePass({label:`substep`});this.encodePredict(r),this.preSubstep?.(r),this.contactEnabled&&(this.contact.encodeDetect(r),this.dispatch(r,`projectStart`,`project`,this.nodeGroups(this.N)));let i=Math.min(8,Math.max(this.params.newtonIterations,t)),a=Math.min(8,Math.max(this.params.newtonMax,i,n));for(let e=0;e<a;e++){e>=i&&(this.dispatch(r,`gate`,`gate${e-1}`,Math.ceil(this.sizeIndex.size/64)),this.gatedIteration=e);try{this.encodeNewtonIteration(r,e)}finally{this.gatedIteration=-1}}this.encodeFinalize(r),r.end()}encodeContactRefresh(e){if(!this.contactEnabled)return;this.contact.encodeClear(e),e.clearBuffer(this.dx);let t=e.beginComputePass({label:`contactRefresh`});this.contact.encodeDetect(t),t.end()}setHistoryEnabled(e){this.device.queue.writeBuffer(this.simParams,24,new Uint32Array([+!!e]))}setNewtonTolerance(e){this.params.newtonTolerance=e,this.device.queue.writeBuffer(this.gateSizes,4,new Float32Array([e]))}setTimestep(e){this.params.h=e,this.device.queue.writeBuffer(this.simParams,0,new Float32Array([e]))}resetState(){let e=this.N,t=new Float32Array(4*e);for(let n=0;n<e;n++)for(let e=0;e<3;e++)t[4*n+e]=this.scene.position[3*n+e];this.setState(t),this.setSegments(this.scene,this.scene.tails),this.setField(this.scene.fieldDamage),this.device.queue.writeBuffer(this.ext,0,new Float32Array(12*e))}setSegments(e,t){this.device.queue.writeBuffer(this.segs,0,this.segData(e)),this.device.queue.writeBuffer(this.tails,0,Float32Array.from(t))}setField(e){this.device.queue.writeBuffer(this.field,0,xt(e,this.scene.fieldArea)),this.device.queue.writeBuffer(this.fieldEvents,0,new Uint32Array([1]))}setState(e,t){this.device.queue.writeBuffer(this.x,0,e),t?this.device.queue.writeBuffer(this.v,0,t):this.device.queue.writeBuffer(this.v,0,new Float32Array(4*this.N))}};function wt(e){return e>>>=0,e^=e>>>16,e=Math.imul(e,2146121005)>>>0,e^=e>>>15,e=Math.imul(e,2221713035)>>>0,e^=e>>>16,e>>>0}function Tt(e,t,n){return wt(e^wt(t^wt(n)))}function q(e,t=0,n=0){return Tt(e,t,n)/4294967296}function Et(e){return e*e*e*(e*(e*6-15)+10)}function Dt(e,t,n,r,i){let a=Tt(e,t,n)/4294967296*Math.PI*2;return Math.cos(a)*r+Math.sin(a)*i}function Ot(e,t,n){let r=Math.floor(t),i=Math.floor(n),a=t-r,o=n-i,s=Et(a),c=Et(o),l=Dt(e,r,i,a,o),u=Dt(e,r+1,i,a-1,o),d=Dt(e,r,i+1,a,o-1),f=Dt(e,r+1,i+1,a-1,o-1),p=l+(u-l)*s;return p+(d+(f-d)*s-p)*c}function J(e,t,n,r,i=2.03,a=.5){let o=0,s=1,c=0,l=t,u=n;for(let t=0;t<r;t++)o+=s*Ot(e+t*1013,l,u),c+=s,s*=a,l*=i,u*=i;return o/c*1.6}function kt(e,t){return Ot(e,t,.5+e%7*.13)}function At(e,t,n){let r=Math.min(1,Math.max(0,(n-e)/(t-e)));return r*r*(3-2*r)}function jt(e){let t=2166136261,n=e=>t=Math.imul(t^e,16777619)>>>0;n(10);for(let t of e.layers){let e=JSON.stringify(t.material);for(let t=0;t<e.length;t++)n(e.charCodeAt(t))}for(let n=0;n<e.fieldDamage.length;n+=64)t=Math.imul(t^e.fieldDamage[n]^e.fieldArea[n]<<16^n<<8,16777619)>>>0;let r=new Float32Array(e.position),i=new Uint32Array(r.buffer);for(let e=0;e<i.length;e++)t=Math.imul(t^i[e],16777619)>>>0;for(let n=0;n<e.segFlags.length;n++)t=Math.imul(t^e.segFlags[n],16777619)>>>0;return t>>>0}function Mt(e,t,n){let r=Math.floor(t),i=Math.floor(n),a=1e9,o=1e9;for(let s=-1;s<=1;s++)for(let c=-1;c<=1;c++){let l=r+c,u=i+s,d=l+.15+.7*q(e,l,u),f=u+.15+.7*q(e+17,l,u),p=Math.hypot(d-t,f-n);p<a?(o=a,a=p):p<o&&(o=p)}return[a,o]}function Nt(e,t,n,r){if(e.amount<=0)return[0,0];let i=Math.hypot(e.axis[0],e.axis[1])||1,a=e.axis[0]/i,o=e.axis[1]/i,s=n-e.center[0],c=r-e.center[1],l=(s*a+c*o)/e.radii[0],u=(-s*o+c*a)/e.radii[1],d=e.featureScale,f=.32*J(t+3,n/(1.4*d),r/(1.4*d),4),p=1-At(.4,1.1,Math.hypot(l,u)+f),m=1;if(e.cellSize>0){let i=n+.4*d*J(t+11,n/d,r/d,3),a=r+.4*d*J(t+12,n/d,r/d,3),[o,s]=Mt(t+5,i/e.cellSize,a/e.cellSize);m=At(.03,.3,s-o)**.7}p*=(.82+.18*J(t+7,n/(.3*d),r/(.3*d),3))*e.amount;let h=e=>Math.min(1,Math.max(0,e));return[h(p*(.12+.88*m)),h(p**2.2*(.35+.65*m))]}function Pt(e,t,n){let r=e.bundle??[1,1],i=h(e.material,r[0],r[1]),a=Math.floor(e.sizeU/i.pitchU)+1,o=Math.floor(e.sizeV/i.pitchV)+1,s=Math.cos(e.angle),c=Math.sin(e.angle),l=1-e.compressU,u=e.shear,d=1-e.compressV,f=[s*l,s*u-c*d,c*l,c*u+s*d],p=[(a-1)*i.pitchU/2,(o-1)*i.pitchV/2],m=[0,0,e.z];return{info:{index:t,material:i,weave:e.material,bundle:r,nx:a,ny:o,nodeOffset:n,nodeCount:a*o,mapA:f,mapOrigin:m,restCenter:p}}}function Ft(e){let t=[],n=0;for(let r=0;r<e.length;r++){let{info:i}=Pt(e[r],r,n);t.push(i),n+=i.nodeCount}let r=n,i=nt(t),a={version:1,layers:t,nodeCount:r,restUV:new Float64Array(2*r),position:new Float64Array(3*r),mass:new Float64Array(r),pinned:new Uint8Array(r),wear:new Float32Array(r),structuralWear:new Float32Array(r),restLength:new Float64Array(2*r),softening:new Float64Array(2*r),segFlags:new Uint16Array(2*r),intact:new Float64Array(2*r),cutMask:new Uint32Array(2*r),failSite:new Float32Array(2*r),field:i.layers,fieldStrength:new Float32Array(2*i.count),fieldDamage:new Uint8Array(2*i.count),fieldArea:new Uint8Array(2*i.count).fill(255),crossingNormal0:new Float64Array(r),tails:new Float64Array(4*r)};for(let n=0;n<e.length;n++)Lt(a,e[n],t[n]),Rt(a,e[n],t[n],i.layers[n]);let o=e=>(a.segFlags[e]&3)==1,s=Uint16Array.from(a.segFlags);ut(t,i.layers,a.fieldArea,a.fieldDamage,a,o,2);for(let e=0;e<a.segFlags.length;e++)a.segFlags[e]&2&&!(s[e]&2)&&(a.segFlags[e]|=4);return a}function It(e,t,n,r){let i=Math.cos(e.angle),a=Math.sin(e.angle),o=n-t.restCenter[0],s=r-t.restCenter[1];return[i*o-a*s,a*o+i*s]}function Lt(e,t,n){let r=n.material,{nx:i,ny:a,nodeOffset:o,mapA:s,mapOrigin:c,restCenter:l}=n,u=g(r),d=t.seed,f=r.yarns[0],p=r.yarns[1],m=t.collarRows;for(let h=0;h<a;h++)for(let g=0;g<i;g++){let _=o+h*i+g,v=g*r.pitchU,y=h*r.pitchV;e.restUV[2*_]=v,e.restUV[2*_+1]=y;let b=v-l[0],x=y-l[1],S=c[0]+s[0]*b+s[1]*x,C=c[1]+s[2]*b+s[3]*x,w=g<m||h<m||g>=i-m||h>=a-m,T=1-At(.16,.24,Math.hypot(S,C)),E=w?0:t.perturbation*T*J(101,S/.04,C/.04,3);e.position[3*_]=S,e.position[3*_+1]=C,e.position[3*_+2]=c[2]+E,e.mass[_]=u,e.pinned[_]=+!!w;let[D,O]=It(t,n,v,y),[k,A]=Nt(t.wear,d,D,O);e.wear[_]=A,e.structuralWear[_]=k,e.crossingNormal0[_]=r.crossingNormal0*(1-.7*k);for(let t=0;t<2;t++){let n=2*_+t;if(!(t===0?g<i-1:h<a-1))continue;let o=t===0?f:p;e.segFlags[n]=1,e.restLength[n]=t===0?r.pitchU:r.pitchV,e.intact[n]=1,e.softening[n]=o.softeningOpening,e.failSite[n]=.5}}}const Y=.001;function Rt(e,t,n,r){if(r.bu>32||r.bv>32)throw Error(`bundle too large for the cut masks`);let i=n.weave,a=t.seed,o=i.pitchU,s=i.pitchV,c=-r.bu*o,l=-r.bv*s,u=Math.ceil((r.K+2*r.bu)*o/Y)+2,d=Math.ceil((r.M+2*r.bv)*s/Y)+2,f=new Float32Array(u*d),p=new Float32Array(u*d),m=new Float32Array(u*d);for(let e=0;e<d;e++)for(let r=0;r<u;r++){let[i,o]=It(t,n,c+r*Y,l+e*Y);f[e*u+r]=Nt(t.wear,a,i,o)[0],p[e*u+r]=J(a+503,i/.011,o/.011,3),m[e*u+r]=J(a+991,i/.004,o/.004,2)}let h=(e,t,n)=>{let r=Math.min(u-1.001,Math.max(0,(t-c)/Y)),i=Math.min(d-1.001,Math.max(0,(n-l)/Y)),a=Math.floor(r),o=Math.floor(i),s=r-a,f=i-o,p=e[o*u+a]+(e[o*u+a+1]-e[o*u+a])*s;return p+(e[(o+1)*u+a]+(e[(o+1)*u+a+1]-e[(o+1)*u+a])*s-p)*f},g=t.wear.defectThreshold;for(let n=0;n<r.M;n++){let c=(n-(r.bv-1)/2)*s;for(let s=0;s<r.K;s++){let l=(s-(r.bu-1)/2)*o,u=r.offset+n*r.K+s,d=h(f,l,c),_=h(p,l,c);for(let r=0;r<2;r++){let o=t.wearStrengthLoss[r],f=r===0?d**1.3:d**1.25,p=r===1?s:n,m=r===1?c:l,h=1+.25*kt(a+4099+13*p+7*r,m/.0025),g=(q(a+503,u,r)+q(a+617,u,r)-1)*2.45,v=Math.exp((.2+.12*d)*_+(.06+.22*d)*g),y=Math.max(.02,1-o*f);e.fieldArea[2*u+r]=it(y),e.fieldStrength[2*u+r]=i.yarns[r].strength*Math.max(.005,y*v*h)}d>g+.04*h(m,l,c)+.012*(q(a+990,s)-.5)&&q(a+991,s,n)<t.wear.defectDensity&&(e.fieldDamage[2*u+1]=255);let v=i.twillRepeat,y=Math.floor((n-s%v+4*v)/v),b=.02*At(t.wear.sparseFrom,g,d)**2,x=((n-s)%v+v)%v<i.twillWarpOver;b>0&&x&&q(a+997,s,y)<b&&(e.fieldDamage[2*u+1]=255)}}}function zt(){return[{material:m,bundle:[9,6],sizeU:.62,sizeV:.4,z:0,angle:.06,compressU:.025,compressV:-.002,shear:.06,collarRows:2,wear:{center:[.01,-.006],axis:[1,-1.15],radii:[.2,.14],amount:1,cellSize:.075,featureScale:.05,defectThreshold:.89,defectDensity:1,sparseFrom:.6},wearStrengthLoss:[.45,.9],seed:1001,perturbation:.0025}]}function Bt(e,t){if(t.byteLength!==16+16*e.N)return!1;let n=new Uint32Array(t,0,4);return n[0]!==1346458180||n[1]!==1||n[2]!==e.N||n[3]!==jt(e.scene)?!1:(e.device.queue.writeBuffer(e.x,0,new Float32Array(t,16)),!0)}async function Vt(e,t){let n=t.params,r={newtonIterations:n.newtonIterations,newtonMax:n.newtonMax,pcgIterations:n.pcgIterations};n.newtonIterations=5,n.newtonMax=5,n.pcgIterations=2,t.setHistoryEnabled(!1);try{for(let n=0;n<420;n++){let r=e.createCommandEncoder({label:`settle`});if(t.encodeSubstep(r),n%10==9&&n<360&&r.clearBuffer(t.v),e.queue.submit([r.finish()]),n%2==1){let t=performance.now();await e.queue.onSubmittedWorkDone(),await new Promise(e=>setTimeout(e,Math.min(30,performance.now()-t)))}}}finally{Object.assign(n,r),t.setHistoryEnabled(!0)}let i=e.createCommandEncoder({label:`settle.end`});i.clearBuffer(t.v),i.clearBuffer(t.counters),e.queue.submit([i.finish()]),await e.queue.onSubmittedWorkDone()}var Ht=`// Dynamic node state (x.w): 0 = cloth, 1 = ballistic debris (part of a piece no longer connected to
 // a mount or the grip: it leaves the linear solve and falls freely), 2 = retired (fell out of the
 // scene: frozen and not drawn). Detached pieces are found on the CPU from the packed connectivity;
 // their rigid modes are resolved only by inertia, which f32 cannot represent next to yarn stiffness.
@@ -7195,4 +7679,4 @@ fn applyFreed(@builtin(global_invocation_id) gid: vec3<u32>) {
   x[n].w = 1.0;
   fixedN[n] = 1u;
 }
-`,jt=class{device;solver;scene;mod;group;packPipe;applyPipe;packed;freedBuf;staging;freed;visited;queue;stride;column;row;tail=0;busy=!1;epoch=0;again=!1;anchors=[];freedCount=0;constructor(e,t,n){this.device=e,this.solver=t,this.scene=n;let r=n.nodeCount;this.mod=new f(e,`state`,_+At),this.packPipe=this.mod.pipeline(`pack`),this.applyPipe=this.mod.pipeline(`applyFreed`),this.packed=a(e,`state.packed`,4*r),this.freedBuf=a(e,`state.freed`,4*r),this.staging=e.createBuffer({label:`state.staging`,size:Math.max(16,4*r),usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ}),this.group=this.mod.bindGroup(`state`,{0:t.simParams,1:t.segs,2:t.x,3:t.levels[0].fixed,4:this.packed,5:this.freedBuf}),this.freed=new Uint32Array(r),this.visited=new Uint8Array(r),this.queue=new Int32Array(r),this.stride=new Int32Array(r),this.column=new Int32Array(r),this.row=new Int32Array(r);for(let e of n.layers)for(let t=0;t<e.nodeCount;t++){let n=e.nodeOffset+t;this.stride[n]=e.nx,this.column[n]=t%e.nx,this.row[n]=Math.floor(t/e.nx)}}request(e){return this.anchors=e,this.busy?(this.again=!0,Promise.resolve()):this.run()}reset(){this.epoch++,this.again=!1;let e=this.device.createCommandEncoder({label:`state.reset`});e.clearBuffer(this.freedBuf),this.device.queue.submit([e.finish()]);let t=new Uint32Array(this.scene.nodeCount);for(let e=0;e<t.length;e++)t[e]=this.scene.pinned[e];this.device.queue.writeBuffer(this.solver.levels[0].fixed,0,t)}async run(){this.busy=!0;try{do{this.again=!1;let e=this.epoch,t=this.anchors,n=this.device.createCommandEncoder({label:`state.pack`}),r=n.beginComputePass();r.setBindGroup(0,this.group),r.setPipeline(this.packPipe),r.dispatchWorkgroups(Math.ceil(this.scene.nodeCount/128)),r.end(),n.copyBufferToBuffer(this.packed,0,this.staging,0,4*this.scene.nodeCount),this.device.queue.submit([n.finish()]),await this.staging.mapAsync(GPUMapMode.READ);let i=new Uint32Array(this.staging.getMappedRange()).slice();if(this.staging.unmap(),e===this.epoch&&this.search(i,t)>0){this.device.queue.writeBuffer(this.freedBuf,0,this.freed);let e=this.device.createCommandEncoder({label:`state.apply`}),t=e.beginComputePass();t.setBindGroup(0,this.group),t.setPipeline(this.applyPipe),t.dispatchWorkgroups(Math.ceil(this.scene.nodeCount/128)),t.end(),this.device.queue.submit([e.finish()])}}while(this.again)}finally{this.busy=!1}}search(e,t){let n=this.scene,r=this.visited;r.fill(0),this.tail=0;for(let t=0;t<n.nodeCount;t++)n.pinned[t]&&this.push(e,t);this.flood(e,0);for(let n of t){if(r[n]||e[n]&4)continue;let t=this.tail;this.push(e,n),this.flood(e,t)}let i=0;for(let t=0;t<n.nodeCount;t++){let n=+(!r[t]&&!(e[t]&4));this.freed[t]=n,i+=n}return this.freedCount+=i,i}push(e,t){this.visited[t]||e[t]&4||(this.visited[t]=1,this.queue[this.tail++]=t)}flood(e,t){let{stride:n,column:r}=this;for(;t<this.tail;){let i=this.queue[t++],a=n[i];e[i]&1&&this.push(e,i+1),e[i]&2&&this.push(e,i+a),r[i]>0&&e[i-1]&1&&this.push(e,i-1),this.row[i]>0&&e[i-a]&2&&this.push(e,i-a)}}},Mt=class{device;counters;log;free=[];staging=null;count=0;constructor(e,t){this.device=e,this.counters=t,this.log=e.createBuffer({label:`acousticLog`,size:1536,usage:GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST});for(let t=0;t<3;t++)this.free.push(e.createBuffer({label:`acousticStaging${t}`,size:1536,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ}))}begin(){return this.count=0,this.staging=this.free.pop()??null,this.staging!==null}record(e){this.staging&&this.count!==16&&(e.copyBufferToBuffer(this.counters,64,this.log,96*this.count,96),e.clearBuffer(this.counters,64,96),this.count++)}end(){let e=this.staging,t=this.count;if(this.staging=null,this.count=0,!e)return Promise.resolve(null);if(t===0)return this.free.push(e),Promise.resolve(null);let n=this.device.createCommandEncoder({label:`acousticReadback`});return n.copyBufferToBuffer(this.log,0,e,0,96*t),this.device.queue.submit([n.finish()]),e.mapAsync(GPUMapMode.READ,0,96*t).then(()=>{let n=new Uint32Array(e.getMappedRange(0,96*t).slice(0));return e.unmap(),this.free.push(e),{raw:n,count:t}},()=>(this.free.push(e),null))}};const Nt=self,X=e=>Nt.postMessage(e),Z=e=>X({type:`progress`,value:e});async function Pt(){let e=e=>fetch(new URL(`/texture/${e}`,self.location.href)).then(t=>t.ok?t.blob():Promise.reject(Error(e))).then(e=>createImageBitmap(e,{colorSpaceConversion:`none`,premultiplyAlpha:`none`}));try{let[t,n,r,i]=await Promise.all([e(`floor_baseColor.jpg`),e(`floor_normal.png`),e(`floor_roughness.jpg`),e(`floor_AO.jpg`)]);return{base:t,normal:n,roughness:r,ao:i}}catch{return null}}const Q=st.h,$=new class{device;context;scene;solver;renderer;interaction;topology;topologyEvents=0;camera={...Ce};width=1;height=1;cssWidth=1;cssHeight=1;visible=!0;ready=!1;lastFrame=0;simBacklog=0;grips=/* @__PURE__ */ new Map;down=/* @__PURE__ */ new Map;picking=/* @__PURE__ */ new Map;pickToken=0;audioPort=null;acoustic=null;lastPan=/* @__PURE__ */ new Float64Array(4);anchors=/* @__PURE__ */ new Float32Array(16);snapshot=null;inFlight=!1;asleep=!1;restFor=0;speedProbe=null;probeBusy=!1;probeSteps=0;dirty=!0;lastPresent=0;statsTime=0;frameCount=0;substepsDone=0;async init(t,r,i,a,o){X({type:`status`,state:`loading`});let s=fetch(new URL(`/drape.bin`,self.location.href)).then(e=>e.ok?e.arrayBuffer():null).catch(()=>null),c=Pt(),l=await n(navigator.gpu);Z(.1),this.device=l.device,this.device.lost.then(e=>{X({type:`status`,state:`error`,message:e.reason===`destroyed`?``:`The graphics device was lost. Reload to continue.`}),this.ready=!1}),this.device.addEventListener(`uncapturederror`,e=>console.error(`GPU`,e.error.message));let u=t.getContext(`webgpu`);if(!u)throw new e(`Could not create a WebGPU canvas context.`);this.context=u;let d=navigator.gpu.getPreferredCanvasFormat();u.configure({device:this.device,format:d,alphaMode:`opaque`}),this.width=r,this.height=i,this.cssWidth=a,this.cssHeight=o,t.width=r,t.height=i,this.scene=Ct(Dt()),Z(.25),this.solver=new dt(this.device,this.scene,st),Z(.5),this.interaction=new Fe(this.device,this.solver,this.scene),this.solver.preSubstep=e=>this.interaction.encodeSubstep(e),this.solver.preAssemble=e=>this.interaction.encode(e),this.topology=new jt(this.device,this.solver,this.scene),this.renderer=new I(this.device,d,this.solver,this.scene),this.renderer.resize(r,i),this.speedProbe=this.device.createBuffer({label:`speedProbe`,size:16,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ}),Z(.7);let f=await c;f&&this.renderer.setFloorImages(f),await this.settle(await s),Z(.9),await this.topology.request([]),Z(1),this.ready=!0,this.audioPort&&this.startAcoustics(),this.asleep=!0,this.lastFrame=performance.now(),X({type:`status`,state:`running`}),X({type:`cursor`,cursor:`grab`}),Nt.requestAnimationFrame(e=>this.frame(e))}async settle(e){e!==null&&Ot(this.solver,e)||await kt(this.device,this.solver);let t=(e,t)=>this.device.createBuffer({label:t,size:e.size,usage:GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST});this.snapshot={x:t(this.solver.x,`snap.x`),segs:t(this.solver.segs,`snap.segs`),tails:t(this.solver.tails,`snap.tails`),field:t(this.solver.field,`snap.field`)};let n=this.device.createCommandEncoder();n.copyBufferToBuffer(this.solver.x,0,this.snapshot.x,0,this.solver.x.size),n.copyBufferToBuffer(this.solver.segs,0,this.snapshot.segs,0,this.solver.segs.size),n.copyBufferToBuffer(this.solver.tails,0,this.snapshot.tails,0,this.solver.tails.size),n.copyBufferToBuffer(this.solver.field,0,this.snapshot.field,0,this.solver.field.size),this.device.queue.submit([n.finish()]),await this.device.queue.onSubmittedWorkDone()}reset(){if(!this.ready||!this.snapshot)return;this.releaseAll();let e=this.device.createCommandEncoder({label:`reset`});e.copyBufferToBuffer(this.snapshot.x,0,this.solver.x,0,this.solver.x.size),e.copyBufferToBuffer(this.snapshot.segs,0,this.solver.segs,0,this.solver.segs.size),e.copyBufferToBuffer(this.snapshot.tails,0,this.solver.tails,0,this.solver.tails.size),e.copyBufferToBuffer(this.snapshot.field,0,this.solver.field,0,this.solver.field.size),e.clearBuffer(this.solver.v),e.clearBuffer(this.solver.ext),e.clearBuffer(this.solver.counters),e.clearBuffer(this.solver.acousticSources),this.renderer.resetTopology(e),this.device.queue.submit([e.finish()]),this.topology.reset(),this.topology.request([]),this.topologyEvents=0,this.simBacklog=0,this.asleep=!0,this.dirty=!0}setSize(e,t,n,r){this.width=e,this.height=t,this.cssWidth=n,this.cssHeight=r;let i=this.context.canvas;i.width=e,i.height=t,this.renderer?.resize(e,t),this.dirty=!0}wake(){this.asleep&&(this.asleep=!1,this.restFor=0,this.simBacklog=0)}ray(e,t){let n=F(this.camera,this.width/this.height),r=e/this.cssWidth*2-1,i=1-t/this.cssHeight*2,a=re(n.invViewProj,[r,i,0]),o=re(n.invViewProj,[r,i,1]),s=[a[0]/a[3],a[1]/a[3],a[2]/a[3]];return{origin:s,dir:D(w([o[0]/o[3],o[1]/o[3],o[2]/o[3]],s))}}pointer(e){if(this.ready){if(e.phase===`cancel`&&e.id===-1)this.releaseAll();else if(e.phase===`down`){if(this.down.has(e.id)||this.down.size>=4)return;this.down.set(e.id,e),this.beginGrip(e)}else if(e.phase===`move`){if(!this.down.has(e.id))return;this.down.set(e.id,e);let t=this.grips.get(e.id);t&&this.updateGripTarget(t,e)}else this.down.delete(e.id),this.picking.delete(e.id),this.endGrip(e.id)}}async beginGrip(e){let t=++this.pickToken;this.picking.set(e.id,t);let n=F(this.camera,this.width/this.height),r=e.x/this.cssWidth*this.width,i=e.y/this.cssHeight*this.height,a=Math.max(8,.016*this.height),o=await this.interaction.pickAt(n.viewProj,r,i,this.width,this.height,a);if(this.picking.get(e.id)!==t||(this.picking.delete(e.id),!o||!this.down.has(e.id))||this.interaction.holder(o.node)>=0)return;let s=this.interaction.freeSlot(),c=o.position;if(s<0||!this.interaction.attach(o.node,c,s))return;let l=D(w(this.camera.target,n.eye)),u={slot:s,node:o.node,plane:c,normal:l,handle:c,target:c,depth:0,engageTime:performance.now()};this.grips.set(e.id,u),this.audioPort?.postMessage({grip:s,held:!0}),this.wake(),X({type:`cursor`,cursor:`grabbing`}),this.updateGripTarget(u,this.down.get(e.id)??e)}updateGripTarget(e,t){let{origin:n,dir:r}=this.ray(t.x,t.y),i=T(r,e.normal);Math.abs(i)<1e-6||(e.target=k(n,O(r,T(w(e.plane,n),e.normal)/i)))}endGrip(e){let t=this.grips.get(e);t&&(this.interaction.release(t.slot),this.grips.delete(e),this.audioPort?.postMessage({grip:t.slot,held:!1}),this.topology.request(this.interaction.coreNodes),this.grips.size===0&&X({type:`cursor`,cursor:`grab`}))}releaseAll(){this.pickToken++,this.picking.clear(),this.down.clear();for(let e of[...this.grips.keys()])this.endGrip(e)}wheel(e){if(this.grips.size>0)for(let t of this.grips.values())t.depth=Math.max(-.03,Math.min(.1,t.depth-e*6e-5));else this.camera.distance=Math.max(.3,Math.min(1.15,this.camera.distance*Math.exp(e*8e-4))),this.dirty=!0}stepHandles(e){let t=performance.now();for(let n of this.grips.values()){let r=(t-n.engageTime)/1e3,i=Math.min(1,r/L.engageTime),a=Math.hypot(n.target[0]-n.plane[0],n.target[1]-n.plane[1],n.target[2]-n.plane[2]),o=-(.002*i+Math.min(.05,.35*a)+n.depth),s=k(n.target,O(n.normal,o));this.interaction.setPinch(Ne(r),n.slot);let c=w(s,n.handle),l=Math.hypot(c[0],c[1],c[2]),u=2.5*e;n.handle=l<=u?s:k(n.handle,O(c,u/l)),this.interaction.setTarget(n.handle,n.slot)}}updateAnchors(){if(this.grips.size!==0){this.anchors.fill(0);for(let e of this.grips.values())this.anchors.set([e.handle[0],e.handle[1],e.handle[2],1],4*e.slot);this.device.queue.writeBuffer(this.solver.acousticSources,0,this.anchors)}}setAudio(e){this.audioPort=e,this.ready&&this.startAcoustics()}startAcoustics(){if(this.acoustic)return;this.acoustic=new Mt(this.device,this.solver.counters);let e=this.device.createCommandEncoder({label:`acousticStart`});e.clearBuffer(this.solver.counters,64,96),this.device.queue.submit([e.finish()])}sendAcoustics(e,t,n,r){if(!this.audioPort)return;let i=new Float32Array(t*13);for(let a=0;a<t;a++){for(let t=0;t<4;t++){let n=nt(e,a*24,t);if(!n)continue;let i=re(r,n);i[3]>1e-6&&(this.lastPan[t]=Math.max(-1,Math.min(1,i[0]/i[3])))}rt(e,a*24,i,a*13,n,this.lastPan)}this.audioPort.postMessage(i,[i.buffer])}probeRest(e){if(this.probeBusy||!this.speedProbe){this.probeSteps+=e;return}let t=this.speedProbe,n=(this.probeSteps+e)*Q;this.probeSteps=0,this.probeBusy=!0;let r=this.device.createCommandEncoder({label:`restProbe`});r.copyBufferToBuffer(this.solver.counters,0,t,0,16),r.clearBuffer(this.solver.counters,8,4),this.device.queue.submit([r.finish()]),t.mapAsync(GPUMapMode.READ).then(()=>{let e=t.getMappedRange(),r=new Float32Array(e)[2],i=new Uint32Array(e,0,2),a=i[0]+i[1];if(t.unmap(),a!==this.topologyEvents&&(this.topologyEvents=a,this.topology.request(this.interaction.coreNodes)),this.probeBusy=!1,this.grips.size>0||this.asleep){this.restFor=0;return}this.restFor=r<.003?this.restFor+n:0,this.restFor>=.4&&(this.asleep=!0)},()=>this.probeBusy=!1)}frame(e){if(!this.ready)return;Nt.requestAnimationFrame(e=>this.frame(e));let t=Math.min(.1,Math.max(0,(e-this.lastFrame)/1e3));if(this.inFlight||!this.asleep&&(e-this.lastPresent)/1e3<.03133333333333333)return;this.lastFrame=e;let n=0;if(this.visible&&!this.asleep&&(this.simBacklog+=t,n=Math.floor(this.simBacklog/Q),n>5?(n=5,this.simBacklog=0):this.simBacklog-=n*Q),n===0&&!this.dirty)return;this.dirty=!1,this.lastPresent=e,n>0&&this.updateAnchors();let r=n>0&&this.acoustic?.begin()?this.acoustic:null;for(let e=0;e<n;e++){this.stepHandles(Q);let e=this.device.createCommandEncoder({label:`substep`});this.solver.encodeSubstep(e),r?.record(e),this.device.queue.submit([e.finish()])}if(r){let e=t/n,i=F(this.camera,this.width/this.height).viewProj;r.end().then(t=>t&&this.sendAcoustics(t.raw,t.count,e,i))}n>0&&this.probeRest(n),this.substepsDone+=n;let i=this.device.createCommandEncoder({label:`frame`});if(this.renderer.encode(i,this.camera,e/1e3,this.context.getCurrentTexture().createView()),this.device.queue.submit([i.finish()]),this.inFlight=!0,this.device.queue.onSubmittedWorkDone().then(()=>this.inFlight=!1),this.frameCount++,e-this.statsTime>1e3){let t=(e-this.statsTime)/1e3;X({type:`stats`,stats:{frameMs:t*1e3/Math.max(1,this.frameCount),substepsPerFrame:this.substepsDone/Math.max(1,this.frameCount),simWallRatio:this.substepsDone*Q/t,gpuMsPerSubstep:0,gpuRenderMs:0,brokenSegments:0,asleep:this.asleep}}),this.frameCount=0,this.substepsDone=0,this.statsTime=e}}setVisible(e){this.visible=e,e||(this.releaseAll(),this.simBacklog=0),this.dirty=!0}async runSubsteps(e){for(let t=0;t<e;t++){this.stepHandles(Q);let e=this.device.createCommandEncoder({label:`devSubstep`});this.solver.encodeSubstep(e),this.device.queue.submit([e.finish()]),(t&3)==3&&await this.device.queue.onSubmittedWorkDone()}await this.device.queue.onSubmittedWorkDone()}async dev(e){if(!this.ready)return null;if(e.op===`step`){await this.runSubsteps(e.substeps);let t=new Uint32Array(await u(this.device,this.solver.counters,8));return{ruptures:t[0],pulledOut:t[1]}}return e.op===`camera`?(e.distance!==void 0&&(this.camera.distance=e.distance),e.pitch!==void 0&&(this.camera.pitch=e.pitch),e.yaw!==void 0&&(this.camera.yaw=e.yaw),e.target&&(this.camera.target=e.target),this.dirty=!0,null):null}};Nt.onmessage=t=>{let n=t.data;switch(n.type){case`init`:$.init(n.canvas,n.width,n.height,n.cssWidth,n.cssHeight).catch(t=>{console.error(t),X({type:`status`,state:`error`,message:t instanceof e?t.message:`The fabric could not be started on this device.`})});break;case`resize`:$.setSize(n.width,n.height,n.cssWidth,n.cssHeight);break;case`pointer`:$.pointer(n);break;case`wheel`:$.wheel(n.deltaY);break;case`reset`:$.reset();break;case`visibility`:$.setVisible(n.visible);break;case`audio`:$.setAudio(n.port);break;case`dev`:$.dev(n).then(e=>X({type:`devDone`,id:n.id,result:e}),e=>X({type:`devDone`,id:n.id,result:String(e)}))}};
+`,Ut=class{device;solver;scene;mod;group;packPipe;applyPipe;packed;freedBuf;staging;freed;visited;queue;stride;column;row;tail=0;running=null;epoch=0;again=!1;anchors=[];anchorSource;freedCount=0;constructor(e,t,n,r=null){this.device=e,this.anchorSource=r,this.solver=t,this.scene=n;let i=n.nodeCount;this.mod=new f(e,`state`,_+Ht),this.packPipe=this.mod.pipeline(`pack`),this.applyPipe=this.mod.pipeline(`applyFreed`),this.packed=a(e,`state.packed`,4*i),this.freedBuf=a(e,`state.freed`,4*i),this.staging=e.createBuffer({label:`state.staging`,size:Math.max(16,4*i),usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ}),this.group=this.mod.bindGroup(`state`,{0:t.simParams,1:t.segs,2:t.x,3:t.levels[0].fixed,4:this.packed,5:this.freedBuf}),this.freed=new Uint32Array(i),this.visited=new Uint8Array(i),this.queue=new Int32Array(i),this.stride=new Int32Array(i),this.column=new Int32Array(i),this.row=new Int32Array(i);for(let e of n.layers)for(let t=0;t<e.nodeCount;t++){let n=e.nodeOffset+t;this.stride[n]=e.nx,this.column[n]=t%e.nx,this.row[n]=Math.floor(t/e.nx)}}request(e=[]){return this.anchors=e,this.running?(this.again=!0,this.running):(this.running=this.run().finally(()=>this.running=null),this.running)}currentAnchors(){return this.anchorSource?this.anchorSource():this.anchors}reset(){this.epoch++,this.again=!1;let e=this.device.createCommandEncoder({label:`state.reset`});e.clearBuffer(this.freedBuf),this.device.queue.submit([e.finish()]);let t=new Uint32Array(this.scene.nodeCount);for(let e=0;e<t.length;e++)t[e]=this.scene.pinned[e];this.device.queue.writeBuffer(this.solver.levels[0].fixed,0,t)}async run(){do{this.again=!1;let e=this.epoch,t=this.device.createCommandEncoder({label:`state.pack`}),n=t.beginComputePass();n.setBindGroup(0,this.group),n.setPipeline(this.packPipe),n.dispatchWorkgroups(Math.ceil(this.scene.nodeCount/128)),n.end(),t.copyBufferToBuffer(this.packed,0,this.staging,0,4*this.scene.nodeCount),this.device.queue.submit([t.finish()]),await this.staging.mapAsync(GPUMapMode.READ);let r=new Uint32Array(this.staging.getMappedRange()).slice();if(this.staging.unmap(),e===this.epoch&&this.search(r,this.currentAnchors())>0){this.device.queue.writeBuffer(this.freedBuf,0,this.freed);let e=this.device.createCommandEncoder({label:`state.apply`}),t=e.beginComputePass();t.setBindGroup(0,this.group),t.setPipeline(this.applyPipe),t.dispatchWorkgroups(Math.ceil(this.scene.nodeCount/128)),t.end(),this.device.queue.submit([e.finish()])}}while(this.again)}search(e,t){let n=this.scene,r=this.visited;r.fill(0),this.tail=0;for(let t=0;t<n.nodeCount;t++)n.pinned[t]&&this.push(e,t);this.flood(e,0);for(let n of t){if(r[n]||e[n]&4)continue;let t=this.tail;this.push(e,n),this.flood(e,t)}let i=0;for(let t=0;t<n.nodeCount;t++){let n=+(!r[t]&&!(e[t]&4));this.freed[t]=n,i+=n}return this.freedCount+=i,i}push(e,t){this.visited[t]||e[t]&4||(this.visited[t]=1,this.queue[this.tail++]=t)}flood(e,t){let{stride:n,column:r}=this;for(;t<this.tail;){let i=this.queue[t++],a=n[i];e[i]&1&&this.push(e,i+1),e[i]&2&&this.push(e,i+a),r[i]>0&&e[i-1]&1&&this.push(e,i-1),this.row[i]>0&&e[i-a]&2&&this.push(e,i-a)}}},Wt=class{device;counters;log;free=[];staging=null;count=0;constructor(e,t){this.device=e,this.counters=t,this.log=e.createBuffer({label:`acousticLog`,size:1536,usage:GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST});for(let t=0;t<3;t++)this.free.push(e.createBuffer({label:`acousticStaging${t}`,size:1536,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ}))}begin(){return this.count=0,this.staging=this.free.pop()??null,this.staging!==null}record(e){this.staging&&this.count!==16&&(e.copyBufferToBuffer(this.counters,64,this.log,96*this.count,96),e.clearBuffer(this.counters,64,96),this.count++)}end(){let e=this.staging,t=this.count;if(this.staging=null,this.count=0,!e)return Promise.resolve(null);if(t===0)return this.free.push(e),Promise.resolve(null);let n=this.device.createCommandEncoder({label:`acousticReadback`});return n.copyBufferToBuffer(this.log,0,e,0,96*t),this.device.queue.submit([n.finish()]),e.mapAsync(GPUMapMode.READ,0,96*t).then(()=>{let n=new Uint32Array(e.getMappedRange(0,96*t).slice(0));return e.unmap(),this.free.push(e),{raw:n,count:t}},()=>(this.free.push(e),null))}};const Gt=self,X=e=>Gt.postMessage(e),Z=e=>X({type:`progress`,value:e});async function Kt(){let e=e=>fetch(new URL(`/texture/${e}`,self.location.href)).then(t=>t.ok?t.blob():Promise.reject(Error(e))).then(e=>createImageBitmap(e,{colorSpaceConversion:`none`,premultiplyAlpha:`none`}));try{let[t,n,r,i]=await Promise.all([e(`floor_baseColor.jpg`),e(`floor_normal.png`),e(`floor_roughness.jpg`),e(`floor_AO.jpg`)]);return{base:t,normal:n,roughness:r,ao:i}}catch{return null}}const Q=vt.h,qt=e=>performance.timeOrigin+e,$=new class{device;context;scene;solver;renderer;interaction;topology;topologyEvents=0;camera={...Se};width=1;height=1;cssWidth=1;cssHeight=1;visible=!0;ready=!1;lastFrame=0;simBacklog=0;refineSteps=0;releaseEpoch=0;grips=/* @__PURE__ */ new Map;down=/* @__PURE__ */ new Map;picking=/* @__PURE__ */ new Map;pickToken=0;audioPort=null;acoustic=null;lastPan=/* @__PURE__ */ new Float64Array(4);anchors=/* @__PURE__ */ new Float32Array(16);snapshot=null;inFlight=!1;asleep=!1;restFor=0;speedProbe=null;probeBusy=!1;probeSteps=0;dirty=!0;lastPresent=0;statsTime=0;frameCount=0;substepsDone=0;async init(t,r,i,a,o){X({type:`status`,state:`loading`});let s=fetch(new URL(`/drape.bin`,self.location.href)).then(e=>e.ok?e.arrayBuffer():null).catch(()=>null),c=Kt(),l=await n(navigator.gpu);Z(.1),this.device=l.device,this.device.lost.then(e=>{X({type:`status`,state:`error`,message:e.reason===`destroyed`?``:`The graphics device was lost. Reload to continue.`}),this.ready=!1}),this.device.addEventListener(`uncapturederror`,e=>console.error(`GPU`,e.error.message));let u=t.getContext(`webgpu`);if(!u)throw new e(`Could not create a WebGPU canvas context.`);this.context=u;let d=navigator.gpu.getPreferredCanvasFormat();u.configure({device:this.device,format:d,alphaMode:`opaque`}),this.width=r,this.height=i,this.cssWidth=a,this.cssHeight=o,t.width=r,t.height=i,this.scene=Ft(zt()),Z(.25),this.solver=new Ct(this.device,this.scene,vt),Z(.5),this.interaction=new Le(this.device,this.solver,this.scene),this.solver.preSubstep=e=>this.interaction.encodeSubstep(e),this.solver.preAssemble=e=>this.interaction.encode(e),this.topology=new Ut(this.device,this.solver,this.scene,()=>this.interaction.coreNodes),this.renderer=new I(this.device,d,this.solver,this.scene),this.renderer.resize(r,i),this.speedProbe=this.device.createBuffer({label:`speedProbe`,size:16,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ}),Z(.7);let f=await c;f&&this.renderer.setFloorImages(f),await this.settle(await s),Z(.9),await this.topology.request(),Z(1),this.ready=!0,this.audioPort&&this.startAcoustics(),this.asleep=!0,this.lastFrame=performance.now(),X({type:`status`,state:`running`}),X({type:`cursor`,cursor:`grab`}),Gt.requestAnimationFrame(e=>this.frame(e))}async settle(e){e!==null&&Bt(this.solver,e)||await Vt(this.device,this.solver);let t=(e,t)=>this.device.createBuffer({label:t,size:e.size,usage:GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST});this.snapshot={x:t(this.solver.x,`snap.x`),segs:t(this.solver.segs,`snap.segs`),tails:t(this.solver.tails,`snap.tails`),field:t(this.solver.field,`snap.field`)};let n=this.device.createCommandEncoder();n.copyBufferToBuffer(this.solver.x,0,this.snapshot.x,0,this.solver.x.size),n.copyBufferToBuffer(this.solver.segs,0,this.snapshot.segs,0,this.solver.segs.size),n.copyBufferToBuffer(this.solver.tails,0,this.snapshot.tails,0,this.solver.tails.size),n.copyBufferToBuffer(this.solver.field,0,this.snapshot.field,0,this.solver.field.size),this.device.queue.submit([n.finish()]),await this.device.queue.onSubmittedWorkDone()}reset(){if(!this.ready||!this.snapshot)return;this.releaseAll(),this.releaseEpoch++,this.interaction.releaseAll();let e=this.device.createCommandEncoder({label:`reset`});e.copyBufferToBuffer(this.snapshot.x,0,this.solver.x,0,this.solver.x.size),e.copyBufferToBuffer(this.snapshot.segs,0,this.solver.segs,0,this.solver.segs.size),e.copyBufferToBuffer(this.snapshot.tails,0,this.solver.tails,0,this.solver.tails.size),e.copyBufferToBuffer(this.snapshot.field,0,this.solver.field,0,this.solver.field.size),e.clearBuffer(this.solver.v),e.clearBuffer(this.solver.ext),e.clearBuffer(this.solver.counters),e.clearBuffer(this.solver.acousticSources),this.renderer.resetTopology(e),this.device.queue.submit([e.finish()]),this.topology.reset(),this.topology.request(),this.topologyEvents=0,this.simBacklog=0,this.refineSteps=0,this.asleep=!0,this.dirty=!0}setSize(e,t,n,r){this.width=e,this.height=t,this.cssWidth=n,this.cssHeight=r;let i=this.context.canvas;i.width=e,i.height=t,this.renderer?.resize(e,t),this.dirty=!0}wake(){this.asleep&&(this.asleep=!1,this.restFor=0,this.simBacklog=0)}ray(e,t){let n=F(this.camera,this.width/this.height),r=e/this.cssWidth*2-1,i=1-t/this.cssHeight*2,a=j(n.invViewProj,[r,i,0]),o=j(n.invViewProj,[r,i,1]),s=[a[0]/a[3],a[1]/a[3],a[2]/a[3]];return{origin:s,dir:D(w([o[0]/o[3],o[1]/o[3],o[2]/o[3]],s))}}pointer(e){if(!this.ready)return;let t={time:e.time,x:e.x,y:e.y};if(e.phase===`cancel`&&e.id===-1)this.releaseAll();else if(e.phase===`down`){if((this.grips.get(e.id)?.track.upTime??1/0)<1/0&&this.endGrip(e.id),this.down.has(e.id)||this.down.size>=4)return;this.down.set(e.id,new Be(t)),this.beginGrip(e.id,t)}else e.phase===`move`?this.down.get(e.id)?.add(t):e.phase===`up`&&this.grips.has(e.id)?(this.down.get(e.id)?.add(t),this.grips.get(e.id).track.upTime=t.time):(this.down.delete(e.id),this.picking.delete(e.id),this.endGrip(e.id))}async beginGrip(e,t){let n=++this.pickToken;this.picking.set(e,n);let r=F(this.camera,this.width/this.height),i=t.x/this.cssWidth*this.width,a=t.y/this.cssHeight*this.height,o=Math.max(8,.016*this.height),s=await this.interaction.pickAt(r.viewProj,i,a,this.width,this.height,o);if(this.picking.get(e)!==n)return;this.picking.delete(e);let c=this.down.get(e);if(!s||!c||this.interaction.holder(s.node)>=0)return;let l=this.interaction.freeSlot(),u=s.position;if(l<0||!this.interaction.attach(s.node,u,l,s.window))return;let d=D(w(this.camera.target,r.eye)),f={slot:l,node:s.node,hand:new ze(u,O(d,-1)),track:c,plane:u,normal:d,downPoint:u};f.downPoint=this.planePoint(f,c.first)??u,this.grips.set(e,f),this.audioPort?.postMessage({grip:l,held:!0}),this.wake(),X({type:`cursor`,cursor:`grabbing`})}planePoint(e,t){let{origin:n,dir:r}=this.ray(t.x,t.y),i=T(r,e.normal);return Math.abs(i)<1e-6?null:k(n,O(r,T(w(e.plane,n),e.normal)/i))}endGrip(e){this.down.delete(e);let t=this.grips.get(e);if(!t)return;this.grips.delete(e),this.audioPort?.postMessage({grip:t.slot,held:!1}),this.interaction.letGo(t.slot);let n=this.releaseEpoch;this.topology.request().then(()=>{n===this.releaseEpoch&&(this.interaction.release(t.slot),this.refineSteps=Math.round(yt.duration/Q))}),this.grips.size===0&&X({type:`cursor`,cursor:`grab`})}releaseAll(){this.pickToken++,this.picking.clear();for(let e of[...this.grips.keys()])this.endGrip(e);this.down.clear()}wheel(e){if(this.grips.size>0)for(let t of this.grips.values())t.hand.wheel(-e*6e-5);else this.camera.distance=Math.max(.3,Math.min(1.15,this.camera.distance*Math.exp(e*8e-4))),this.dirty=!0}substepIterations(){return this.refineSteps<=0?0:(this.refineSteps--,yt.newtonIterations)}stepHandles(e,t){for(let[n,r]of[...this.grips]){if(r.track.upTime<=t){this.endGrip(n);continue}let i=this.planePoint(r,r.track.at(t));r.track.prune(t),r.hand.step(e,i?w(i,r.downPoint):[0,0,0]),this.interaction.setTarget(r.hand.target,r.slot),this.interaction.setPinch(r.hand.pinch,r.slot)}}updateAnchors(){if(this.grips.size!==0){this.anchors.fill(0);for(let e of this.grips.values())this.anchors.set([...e.hand.target,1],4*e.slot);this.device.queue.writeBuffer(this.solver.acousticSources,0,this.anchors)}}setAudio(e){this.audioPort=e,this.ready&&this.startAcoustics()}startAcoustics(){if(this.acoustic)return;this.acoustic=new Wt(this.device,this.solver.counters);let e=this.device.createCommandEncoder({label:`acousticStart`});e.clearBuffer(this.solver.counters,64,96),this.device.queue.submit([e.finish()])}sendAcoustics(e,t,n,r){if(!this.audioPort)return;let i=new Float32Array(t*13);for(let a=0;a<t;a++){for(let t=0;t<4;t++){let n=pt(e,a*24,t);if(!n)continue;let i=j(r,n);i[3]>1e-6&&(this.lastPan[t]=Math.max(-1,Math.min(1,i[0]/i[3])))}mt(e,a*24,i,a*13,n,this.lastPan)}this.audioPort.postMessage(i,[i.buffer])}probeRest(e){if(this.probeBusy||!this.speedProbe){this.probeSteps+=e;return}let t=this.speedProbe,n=(this.probeSteps+e)*Q;this.probeSteps=0,this.probeBusy=!0;let r=this.device.createCommandEncoder({label:`restProbe`});r.copyBufferToBuffer(this.solver.counters,0,t,0,16),r.clearBuffer(this.solver.counters,8,4),this.device.queue.submit([r.finish()]),t.mapAsync(GPUMapMode.READ).then(()=>{let e=t.getMappedRange(),r=new Float32Array(e)[2],i=new Uint32Array(e,0,2),a=i[0]+i[1];if(t.unmap(),a!==this.topologyEvents&&(this.topologyEvents=a,this.topology.request()),this.probeBusy=!1,this.grips.size>0||this.asleep){this.restFor=0;return}this.restFor=r<.003?this.restFor+n:0,this.restFor>=.4&&(this.asleep=!0)},()=>this.probeBusy=!1)}frame(e){if(!this.ready)return;Gt.requestAnimationFrame(e=>this.frame(e));let t=Math.min(.1,Math.max(0,(e-this.lastFrame)/1e3));if(this.inFlight||!this.asleep&&(e-this.lastPresent)/1e3<.03133333333333333)return;this.lastFrame=e;let n=0;if(this.visible&&!this.asleep&&(this.simBacklog+=t,n=Math.floor(this.simBacklog/Q),n>5?(n=5,this.simBacklog=0):this.simBacklog-=n*Q),n===0&&!this.dirty)return;this.dirty=!1,this.lastPresent=e,n>0&&this.updateAnchors();let r=n>0&&this.acoustic?.begin()?this.acoustic:null,i=qt(e);for(let e=0;e<n;e++){this.stepHandles(Q,i-1e3*t*(1-(e+1)/n));let a=this.device.createCommandEncoder({label:`substep`});this.solver.encodeSubstep(a,this.substepIterations()),r?.record(a),this.device.queue.submit([a.finish()])}if(r){let e=t/n,i=F(this.camera,this.width/this.height).viewProj;r.end().then(t=>t&&this.sendAcoustics(t.raw,t.count,e,i))}n>0&&this.probeRest(n),this.substepsDone+=n;let a=this.device.createCommandEncoder({label:`frame`});if(this.renderer.encode(a,this.camera,e/1e3,this.context.getCurrentTexture().createView()),this.device.queue.submit([a.finish()]),this.inFlight=!0,this.device.queue.onSubmittedWorkDone().then(()=>this.inFlight=!1),this.frameCount++,e-this.statsTime>1e3){let t=(e-this.statsTime)/1e3;X({type:`stats`,stats:{frameMs:t*1e3/Math.max(1,this.frameCount),substepsPerFrame:this.substepsDone/Math.max(1,this.frameCount),simWallRatio:this.substepsDone*Q/t,gpuMsPerSubstep:0,gpuRenderMs:0,brokenSegments:0,asleep:this.asleep}}),this.frameCount=0,this.substepsDone=0,this.statsTime=e}}setVisible(e){this.visible=e,e||(this.releaseAll(),this.simBacklog=0),this.dirty=!0}async runSubsteps(e){for(let t=0;t<e;t++){this.stepHandles(Q,qt(performance.now()));let e=this.device.createCommandEncoder({label:`devSubstep`});this.solver.encodeSubstep(e,this.substepIterations()),this.device.queue.submit([e.finish()]),(t&3)==3&&await this.device.queue.onSubmittedWorkDone()}await this.device.queue.onSubmittedWorkDone()}async dev(e){if(!this.ready)return null;if(e.op===`step`){await this.runSubsteps(e.substeps);let t=new Uint32Array(await u(this.device,this.solver.counters,8));return{ruptures:t[0],pulledOut:t[1]}}return e.op===`camera`?(e.distance!==void 0&&(this.camera.distance=e.distance),e.pitch!==void 0&&(this.camera.pitch=e.pitch),e.yaw!==void 0&&(this.camera.yaw=e.yaw),e.target&&(this.camera.target=e.target),this.dirty=!0,null):null}};Gt.onmessage=t=>{let n=t.data;switch(n.type){case`init`:$.init(n.canvas,n.width,n.height,n.cssWidth,n.cssHeight).catch(t=>{console.error(t),X({type:`status`,state:`error`,message:t instanceof e?t.message:`The fabric could not be started on this device.`})});break;case`resize`:$.setSize(n.width,n.height,n.cssWidth,n.cssHeight);break;case`pointer`:$.pointer(n);break;case`wheel`:$.wheel(n.deltaY);break;case`reset`:$.reset();break;case`visibility`:$.setVisible(n.visible);break;case`audio`:$.setAudio(n.port);break;case`dev`:$.dev(n).then(e=>X({type:`devDone`,id:n.id,result:e}),e=>X({type:`devDone`,id:n.id,result:String(e)}))}};
